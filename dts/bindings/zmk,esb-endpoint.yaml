@@ -1,0 +1,27 @@
+# Copyright (c) 2025 efogdev
+# SPDX-License-Identifier: MIT
+
+description: ZMK ESB endpoint configuration node
+compatible: "zmk,esb-endpoint"
+
+properties:
+  esb-channel:
+    type: int
+    required: true
+    description: RF channel number (0-100). Channel N = 2400+N MHz.
+  pairing-base-address:
+    type: uint8-array
+    required: true
+    description: 4-byte base address for the pairing pipe (pipe 0).
+  pairing-prefix:
+    type: int
+    required: true
+    description: 1-byte address prefix for the pairing pipe (pipe 0).
+  data-base-address:
+    type: uint8-array
+    required: true
+    description: 4-byte base address for the HID data pipe (pipe 1).
+  data-prefix:
+    type: int
+    required: true
+    description: 1-byte address prefix for the HID data pipe (pipe 1).

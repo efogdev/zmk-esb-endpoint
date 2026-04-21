@@ -1,0 +1,36 @@
+config ZMK_ESB_ENDPOINT
+    bool "ESB endpoint on last BLE profile slot"
+    depends on ZMK_BLE
+    select ESB
+    select ESB_DYNAMIC_INTERRUPTS
+    select MPSL
+    select DYNAMIC_INTERRUPTS
+    select DYNAMIC_DIRECT_INTERRUPTS
+    select SETTINGS
+    help
+      Repurposes the last BLE profile slot as an ESB PTX endpoint.
+      The keyboard acts as PTX, sending HID reports to a PRX dongle.
+      Requires nrfxlib in the west workspace.
+
+if ZMK_ESB_ENDPOINT
+
+config ZMK_ESB_ENDPOINT_CHANNEL
+    int "ESB RF channel (0-100)"
+    default 80
+    range 0 100
+
+config ZMK_ESB_ENDPOINT_TIMESLOT_US
+    int "Timeslot length in microseconds"
+    default 800
+    range 400 5000
+
+config ZMK_ESB_ENDPOINT_TIMESLOT_GUARD_US
+    int "Microseconds before slot end to stop ESB"
+    default 200
+    range 100 500
+
+config ZMK_ESB_ENDPOINT_TX_QUEUE_SIZE
+    int "ESB TX packet queue depth"
+    default 4
+
+endif
