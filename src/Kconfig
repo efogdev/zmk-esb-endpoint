@@ -1,36 +1,154 @@
 config ZMK_ESB_ENDPOINT
     bool "ESB endpoint on last BLE profile slot"
     depends on ZMK_BLE
-    select ESB
-    select ESB_DYNAMIC_INTERRUPTS
-    select MPSL
+    select NRFX_PPI if HAS_HW_NRF_PPI
+    select NRFX_DPPI if HAS_HW_NRF_DPPIC
+    select NRFX_TIMER2
     select DYNAMIC_INTERRUPTS
     select DYNAMIC_DIRECT_INTERRUPTS
     select SETTINGS
     help
       Repurposes the last BLE profile slot as an ESB PTX endpoint.
-      The keyboard acts as PTX, sending HID reports to a PRX dongle.
-      Requires nrfxlib in the west workspace.
+      ESB sources live at vendor/nrf-esb (copied from NCS v3.0.2).
+      nrfxlib MPSL is a git submodule at vendor/nrfxlib — run
+      `git submodule update --init --recursive` if missing.
 
 if ZMK_ESB_ENDPOINT
 
-config ZMK_ESB_ENDPOINT_CHANNEL
-    int "ESB RF channel (0-100)"
-    default 80
-    range 0 100
+# BT_LL_SW_SPLIT compile-time reserves PPI channels 6-19, leaving only 0-5
+# for application use. ESB needs all 6 of those. Force UART0 to use
+# interrupt-driven TX so it does not claim channel 5 at boot.
+config UART_0_ENHANCED_POLL_OUT
+    default n
 
-config ZMK_ESB_ENDPOINT_TIMESLOT_US
-    int "Timeslot length in microseconds"
-    default 800
-    range 400 5000
+# ---- ESB Kconfig (mirrors nrf/subsys/esb/Kconfig for compilation) ----
 
-config ZMK_ESB_ENDPOINT_TIMESLOT_GUARD_US
-    int "Microseconds before slot end to stop ESB"
-    default 200
-    range 100 500
+config ESB
+    bool "Enhanced ShockBurst"
+    default y if ZMK_ESB_ENDPOINT
 
-config ZMK_ESB_ENDPOINT_TX_QUEUE_SIZE
-    int "ESB TX packet queue depth"
+if ESB
+
+config ESB_MAX_PAYLOAD_LENGTH
+    int "Maximum ESB payload size"
+    default 32
+    range 1 252
+
+config ESB_TX_FIFO_SIZE
+    int "ESB TX FIFO depth"
     default 4
 
-endif
+config ESB_RX_FIFO_SIZE
+    int "ESB RX FIFO depth"
+    default 4
+
+config ESB_PIPE_COUNT
+    int "ESB pipe count"
+    default 6
+    range 1 8
+
+config ESB_RADIO_IRQ_PRIORITY
+    int "ESB radio interrupt priority"
+    default 1
+
+config ESB_EVENT_IRQ_PRIORITY
+    int "ESB event interrupt priority"
+    default 2
+
+config ESB_SYS_TIMER2
+    bool
+    default y
+
+config ESB_SYS_TIMER_INSTANCE
+    int
+    default 2
+
+config ESB_SYS_TIMER_INSTANCE_LEADING_ZERO
+    bool
+    default n
+
+config ESB_DYNAMIC_INTERRUPTS
+    bool "ESB dynamic interrupt support"
+    default y if ZMK_ESB_ENDPOINT
+
+config ESB_NEVER_DISABLE_TX
+    bool
+    default n
+
+config ESB_FAST_SWITCHING
+    bool
+    default n
+
+config ESB_FAST_CHANNEL_SWITCHING
+    bool
+    default n
+
+module=ESB
+module-str=ESB
+source "${ZEPHYR_BASE}/subsys/logging/Kconfig.template.log_config"
+
+endif # ESB
+
+# ---- Module options ----
+
+config ZMK_ESB_ENDPOINT_HID_NOACK
+    bool "Send mouse HID reports without ACK (fire-and-forget)"
+    default y
+    help
+      When enabled, mouse HID report payloads on pipe 1 are sent with
+      noack=1, skipping the ESB ACK wait and retransmit window for lowest
+      pointer/scroll latency. Pointer motion is a self-correcting stream so
+      occasional drops are tolerable. Keyboard and consumer reports always
+      use ACKs regardless of this option — they are edge-triggered state
+      updates and a lost release packet strands the key on the host.
+      Requires selective_auto_ack (enabled unconditionally in transport cfg).
+      Control packets (BEACON/PAIR/DISCONNECT) always use ACKs so the dongle
+      can piggyback responses.
+
+config ZMK_ESB_ENDPOINT_RETRANSMIT_COUNT
+    int "ESB retransmit count for ACKed packets"
+    default 3
+    range 0 15
+    help
+      Applies to control packets (BEACON/PAIR/DISCONNECT). HID reports sent
+      with noack=1 (see ZMK_ESB_ENDPOINT_HID_NOACK) are not retransmitted
+      regardless of this value.
+
+config ZMK_ESB_ENDPOINT_RETRANSMIT_DELAY_US
+    int "ESB retransmit delay (microseconds)"
+    default 330
+    help
+      Must be > ramp_up(40us) + ack_timeout(160us) + processing latency.
+
+config ZMK_ESB_ENDPOINT_BEACON_INTERVAL_MS
+    int "Pairing beacon interval (milliseconds)"
+    default 50
+    range 10 1000
+    help
+      How often the keyboard broadcasts PAIR beacons while unpaired.
+
+config ZMK_ESB_ENDPOINT_BOOT_CHECK_DELAY_MS
+    int "Boot-time profile check delay (milliseconds)"
+    default 500
+    range 100 10000
+    help
+      ZMK does not raise zmk_ble_active_profile_changed for the profile
+      loaded from settings at boot. This module polls the active profile
+      once after this delay to activate ESB when the loaded profile is
+      the last slot. The delay must be long enough for settings subsystem
+      to finish restoring active_profile.
+
+config ZMK_ESB_ENDPOINT_BLE_QUIESCE_MS
+    int "BLE quiesce delay before ESB activation (milliseconds)"
+    default 50
+    range 0 1000
+    help
+      After disconnecting peers and stopping advertising, wait this long
+      before taking the radio for ESB, so the BLE LL finishes any in-flight
+      radio work.
+
+config ZMK_ESB_ENDPOINT_CTRL_STACK_SIZE
+    int "ESB control thread stack size (bytes)"
+    default 2048
+
+endif # ZMK_ESB_ENDPOINT

@@ -32,7 +32,7 @@ struct esb_pkt_beacon {
     uint8_t type;        /* ESB_PKT_BEACON */
     uint8_t device_id[6];
     uint8_t caps;
-} __packed;
+} __attribute__((__packed__));
 
 /*
  * PAIR_REQ: dongle → keyboard (in ESB ACK payload on pipe 0)
@@ -40,7 +40,7 @@ struct esb_pkt_beacon {
  */
 struct esb_pkt_pair_req {
     uint8_t type; /* ESB_PKT_PAIR_REQ */
-} __packed;
+} __attribute__((__packed__));
 
 /*
  * PAIR_RESP: keyboard → dongle (pipe 0)
@@ -50,7 +50,7 @@ struct esb_pkt_pair_resp {
     uint8_t type;        /* ESB_PKT_PAIR_RESP */
     uint8_t device_id[6];
     uint8_t caps;
-} __packed;
+} __attribute__((__packed__));
 
 /*
  * HID_REPORT: keyboard → dongle (pipe 1)
@@ -60,13 +60,13 @@ struct esb_pkt_hid_report {
     uint8_t type;        /* ESB_PKT_HID_REPORT */
     uint8_t report_type; /* ESB_REPORT_* */
     uint8_t data[30];    /* HID report body, zero-padded */
-} __packed;
+} __attribute__((__packed__));
 
 /*
  * DISCONNECT: either direction (pipe 1)
  */
 struct esb_pkt_disconnect {
     uint8_t type; /* ESB_PKT_DISCONNECT */
-} __packed;
+} __attribute__((__packed__));
 
 #define ESB_MAX_PAYLOAD_LEN 32

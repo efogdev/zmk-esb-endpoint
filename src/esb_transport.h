@@ -24,13 +24,8 @@ typedef void (*esb_transport_cb_t)(const esb_transport_evt_t *evt);
 
 int  esb_transport_init(esb_transport_cb_t cb);
 void esb_transport_deinit(void);
-
-void esb_transport_set_addresses(const uint8_t base0[4], const uint8_t base1[4],
-                                 const uint8_t prefixes[8], uint8_t channel);
-
-/* Queue a packet for transmission (called from thread context). pipe: 0=pairing, 1=data */
+void esb_transport_set_addresses(const uint8_t base0[4], const uint8_t base1[4], const uint8_t prefixes[8], uint8_t channel);
 int  esb_transport_send(uint8_t pipe, const uint8_t *data, uint8_t len);
 
-/* Called from timeslot_handler callbacks (IRQ context) */
 void esb_transport_on_slot_start(void);
 void esb_transport_on_slot_stop(void);

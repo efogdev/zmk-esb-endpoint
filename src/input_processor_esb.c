@@ -13,6 +13,7 @@
 #include <zephyr/device.h>
 #include <zephyr/input/input.h>
 #include <drivers/input_processor.h>
+#include <zmk/hid.h>
 #include <zmk_esb/endpoint.h>
 #include <zmk_esb/protocol.h>
 #include "esb_transport.h"
@@ -29,9 +30,8 @@ struct esb_ip_data {
     uint8_t buttons;
 };
 
-static void send_mouse_report(struct esb_ip_data *d)
-{
-    struct zmk_hid_mouse_report_body body = {
+static void send_mouse_report(struct esb_ip_data *d) {
+    const struct zmk_hid_mouse_report_body body = {
         .buttons    = d->buttons,
         .d_x        = (int16_t)CLAMP(d->dx,       INT16_MIN, INT16_MAX),
         .d_y        = (int16_t)CLAMP(d->dy,       INT16_MIN, INT16_MAX),
@@ -45,20 +45,16 @@ static void send_mouse_report(struct esb_ip_data *d)
     };
     memcpy(pkt.data, &body, sizeof(body));
     esb_transport_send(1, (uint8_t *)&pkt, sizeof(pkt));
-
     d->dx = d->dy = d->scroll_x = d->scroll_y = 0;
 }
 
-static int esb_ip_handle_event(const struct device *dev, struct input_event *event,
-                               uint32_t param1, uint32_t param2,
-                               struct zmk_input_processor_state *state)
-{
+static int esb_ip_handle_event(const struct device *dev, struct input_event *event, uint32_t param1, uint32_t param2,
+                               struct zmk_input_processor_state *state) {
     if (!zmk_esb_endpoint_is_active() || !pairing_is_connected()) {
         return ZMK_INPUT_PROC_CONTINUE;
     }
 
     struct esb_ip_data *d = dev->data;
-
     switch (event->type) {
     case INPUT_EV_REL:
         switch (event->code) {
@@ -74,30 +70,34 @@ static int esb_ip_handle_event(const struct device *dev, struct input_event *eve
         case INPUT_REL_HWHEEL:
             d->scroll_x += event->value;
             break;
+        default: break;
         }
         break;
     case INPUT_EV_KEY:
-        if (event->value) {
-            d->buttons |= BIT(event->code);
-        } else {
-            d->buttons &= ~BIT(event->code);
+        if (event->code >= INPUT_BTN_0 && event->code <= INPUT_BTN_4) {
+            const uint8_t btn = event->code - INPUT_BTN_0;
+            if (event->value) {
+                d->buttons |= BIT(btn);
+            } else {
+                d->buttons &= ~BIT(btn);
+            }
         }
         break;
+    default: break;
     }
 
     if (event->sync) {
         send_mouse_report(d);
     }
 
-    return ZMK_INPUT_PROC_CONTINUE;
+    return ZMK_INPUT_PROC_STOP;
 }
 
 static const struct zmk_input_processor_driver_api esb_ip_api = {
     .handle_event = esb_ip_handle_event,
 };
 
-static int esb_ip_init(const struct device *dev)
-{
+static int esb_ip_init(const struct device *dev) {
     struct esb_ip_data *d = dev->data;
     memset(d, 0, sizeof(*d));
     return 0;
