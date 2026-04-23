@@ -17,8 +17,14 @@
 
 #include "esb_transport.h"
 #include "pairing.h"
+#if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_SHELL_RELAY)
+#include "../shell/shell_relay.h"
+#endif
 
 #include <zephyr/logging/log.h>
+#if IS_ENABLED(CONFIG_SHELL)
+#include <zephyr/shell/shell.h>
+#endif
 
 #include "zmk/ble.h"
 LOG_MODULE_REGISTER(zmk_esb_endpoint, CONFIG_ZMK_LOG_LEVEL);
@@ -185,6 +191,9 @@ static K_WORK_DELAYABLE_DEFINE(boot_profile_check_work, boot_profile_check_fn);
 static int esb_endpoint_init(void) {
     esb_transport_init(on_transport_evt);
     pairing_init();
+#if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_SHELL_RELAY)
+    esb_shell_relay_init();
+#endif
 
     k_thread_create(&esb_ctrl_thread, esb_ctrl_stack, K_THREAD_STACK_SIZEOF(esb_ctrl_stack),
                     esb_ctrl_thread_fn, NULL, NULL, NULL, K_PRIO_COOP(7), 0, K_NO_WAIT);
@@ -195,3 +204,20 @@ static int esb_endpoint_init(void) {
 }
 
 SYS_INIT(esb_endpoint_init, APPLICATION, CONFIG_APPLICATION_INIT_PRIORITY);
+
+#if IS_ENABLED(CONFIG_SHELL)
+static int cmd_esb_unpair(const struct shell *sh, const size_t argc, char **argv) {
+    ARG_UNUSED(argc);
+    ARG_UNUSED(argv);
+    pairing_unpair();
+    shell_print(sh, "ESB: dongle forgotten, beaconing");
+    return 0;
+}
+
+SHELL_STATIC_SUBCMD_SET_CREATE(esb_cmds,
+    SHELL_CMD(unpair, NULL, "Forget paired dongle and start beaconing", cmd_esb_unpair),
+    SHELL_SUBCMD_SET_END
+);
+
+SHELL_CMD_REGISTER(esb, &esb_cmds, "ESB endpoint commands", NULL);
+#endif /* CONFIG_SHELL */

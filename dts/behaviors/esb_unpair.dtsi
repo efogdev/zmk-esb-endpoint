@@ -1,0 +1,14 @@
+/*
+ * Copyright (c) 2025 efogdev
+ * SPDX-License-Identifier: MIT
+ */
+
+/ {
+    behaviors {
+        esb_unpair: esb_unpair {
+            compatible = "zmk,behavior-esb-unpair";
+            #binding-cells = <0>;
+            display-name = "ESB unpair";
+        };
+    };
+};

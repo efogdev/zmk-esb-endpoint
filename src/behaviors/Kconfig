@@ -1,0 +1,4 @@
+config ZMK_ESB_BEHAVIOR_UNPAIR
+    bool "ESB unpair behavior"
+    depends on ZMK_ESB_ENDPOINT
+    default y

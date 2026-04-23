@@ -16,6 +16,9 @@
 #include <esb.h>
 #include "esb_transport.h"
 #include <zmk_esb/protocol.h>
+#if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_SHELL_RELAY)
+#include "../shell/shell_relay.h"
+#endif
 
 #include <zephyr/logging/log.h>
 LOG_MODULE_REGISTER(zmk_esb_transport, CONFIG_ZMK_LOG_LEVEL);
@@ -92,6 +95,10 @@ static void zmk_esb_transport_evt_cb(struct esb_evt const *event) {
 
     switch (event->evt_id) {
     case ESB_EVENT_TX_SUCCESS:
+        tx_ok_count++;
+#if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_SHELL_RELAY)
+        esb_shell_relay_notify_tx();
+#endif
         break;
 
     case ESB_EVENT_TX_FAILED:
@@ -124,7 +131,7 @@ static int esb_init_and_configure(void) {
     cfg.retransmit_delay   = CONFIG_ZMK_ESB_ENDPOINT_RETRANSMIT_DELAY_US;
     cfg.tx_mode            = ESB_TXMODE_AUTO;
     cfg.use_fast_ramp_up   = true;
-    cfg.selective_auto_ack = true;
+    cfg.selective_auto_ack = IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_HID_NOACK);
     cfg.event_handler      = zmk_esb_transport_evt_cb;
     cfg.payload_length     = ESB_MAX_PAYLOAD_LEN;
 

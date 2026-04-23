@@ -18,6 +18,7 @@ typedef enum {
 void pairing_init(void);
 void pairing_start(void);
 void pairing_stop(void);
+void pairing_unpair(void);
 void pairing_on_rx(const uint8_t *data, uint8_t len);
 
 pairing_state_t pairing_get_state(void);

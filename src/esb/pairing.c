@@ -9,6 +9,9 @@
 #include "pairing.h"
 #include "esb_transport.h"
 #include <zmk_esb/protocol.h>
+#if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_SHELL_RELAY)
+#include "../shell/shell_relay.h"
+#endif
 
 #include <zephyr/logging/log.h>
 LOG_MODULE_REGISTER(zmk_esb_pairing, CONFIG_ZMK_LOG_LEVEL);
@@ -83,6 +86,9 @@ void pairing_start(void) {
     if (m_has_stored_peer) {
         LOG_DBG("ESB: known dongle, going CONNECTED");
         m_state = PAIRING_STATE_CONNECTED;
+#if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_SHELL_RELAY)
+        esb_shell_relay_on_connected();
+#endif
     } else {
         LOG_INF("ESB: no dongle, advertising BEACON");
         m_state = PAIRING_STATE_UNPAIRED;
@@ -93,6 +99,19 @@ void pairing_start(void) {
 void pairing_stop(void) {
     m_state = PAIRING_STATE_IDLE;
     k_work_cancel_delayable(&beacon_work);
+#if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_SHELL_RELAY)
+    esb_shell_relay_on_disconnected();
+#endif
+}
+
+void pairing_unpair(void) {
+    m_has_stored_peer = false;
+    save_paired(0);
+    if (m_state != PAIRING_STATE_IDLE) {
+        k_work_cancel_delayable(&beacon_work);
+        m_state = PAIRING_STATE_UNPAIRED;
+        k_work_reschedule(&beacon_work, K_MSEC(10));
+    }
 }
 
 void pairing_on_rx(const uint8_t *data, const uint8_t len) {
@@ -113,6 +132,9 @@ void pairing_on_rx(const uint8_t *data, const uint8_t len) {
 #if IS_ENABLED(CONFIG_ZMK_ADAPTIVE_FEEDBACK)
             zaf_custom_event_trigger(&esb_dongle_paired);
 #endif
+#if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_SHELL_RELAY)
+            esb_shell_relay_on_connected();
+#endif
         }
         break;
 
@@ -122,7 +144,26 @@ void pairing_on_rx(const uint8_t *data, const uint8_t len) {
         m_has_stored_peer = false;
         save_paired(0);
         k_work_reschedule(&beacon_work, K_MSEC(10));
+#if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_SHELL_RELAY)
+        esb_shell_relay_on_disconnected();
+#endif
         break;
+
+#if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_SHELL_RELAY)
+    case ESB_PKT_SHELL_REQ:
+        esb_shell_relay_on_req();
+        break;
+
+    case ESB_PKT_SHELL_DATA: {
+        if (len >= 2) {
+            const struct esb_pkt_shell_data *pkt = (const void *)data;
+            if (pkt->len > 0 && pkt->len <= ESB_PKT_DATA_MAX) {
+                esb_shell_relay_on_data(pkt->data, pkt->len);
+            }
+        }
+        break;
+    }
+#endif /* CONFIG_ZMK_ESB_ENDPOINT_SHELL_RELAY */
 
     default:
         break;

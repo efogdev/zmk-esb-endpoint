@@ -36,10 +36,12 @@ config ESB_MAX_PAYLOAD_LENGTH
 
 config ESB_TX_FIFO_SIZE
     int "ESB TX FIFO depth"
+    default 16 if ZMK_ESB_ENDPOINT_SHELL_RELAY
     default 4
 
 config ESB_RX_FIFO_SIZE
     int "ESB RX FIFO depth"
+    default 16 if ZMK_ESB_ENDPOINT_SHELL_RELAY
     default 4
 
 config ESB_PIPE_COUNT
@@ -93,7 +95,7 @@ endif # ESB
 
 config ZMK_ESB_ENDPOINT_HID_NOACK
     bool "Send mouse HID reports without ACK (fire-and-forget)"
-    default y
+    default n
     help
       When enabled, mouse HID report payloads on pipe 1 are sent with
       noack=1, skipping the ESB ACK wait and retransmit window for lowest
@@ -122,7 +124,7 @@ config ZMK_ESB_ENDPOINT_RETRANSMIT_DELAY_US
 
 config ZMK_ESB_ENDPOINT_BEACON_INTERVAL_MS
     int "Pairing beacon interval (milliseconds)"
-    default 50
+    default 100
     range 10 1000
     help
       How often the keyboard broadcasts PAIR beacons while unpaired.
@@ -150,5 +152,8 @@ config ZMK_ESB_ENDPOINT_BLE_QUIESCE_MS
 config ZMK_ESB_ENDPOINT_CTRL_STACK_SIZE
     int "ESB control thread stack size (bytes)"
     default 2048
+
+rsource "shell/Kconfig"
+rsource "behaviors/Kconfig"
 
 endif # ZMK_ESB_ENDPOINT

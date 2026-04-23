@@ -1,0 +1,1 @@
+target_sources_ifdef(CONFIG_ZMK_ESB_BEHAVIOR_UNPAIR app PRIVATE behavior_esb_unpair.c)

@@ -1,0 +1,46 @@
+config ZMK_ESB_ENDPOINT_SHELL_RELAY
+    bool "ESB shell relay (execute commands forwarded from dongle)"
+    depends on SHELL
+    select SHELL_BACKEND_DUMMY
+    default n
+    help
+      When the dongle requests a shell session (single button press while
+      paired), accepts shell commands via ESB and returns output over ESB.
+      Commands are executed using the Zephyr dummy shell backend.
+      The session ends automatically after SHELL_INACTIVITY_S of no input.
+
+config ZMK_ESB_ENDPOINT_SHELL_POLL_INTERVAL_MS
+    int "Shell poll interval (ms)"
+    default 50
+    range 10 500
+    depends on ZMK_ESB_ENDPOINT_SHELL_RELAY
+    help
+      How often the keyboard sends SHELL_POLL packets to solicit queued
+      user input from the dongle when no HID events are occurring.
+
+config ZMK_ESB_ENDPOINT_SHELL_INACTIVITY_S
+    int "Shell inactivity timeout (seconds)"
+    default 60
+    range 0 3600
+    depends on ZMK_ESB_ENDPOINT_SHELL_RELAY
+    help
+      If no command bytes arrive within this period, the keyboard sends
+      SHELL_STOP and exits shell relay mode.
+
+config ZMK_ESB_ENDPOINT_SHELL_CMD_BUF_SIZE
+    int "Shell command buffer size (bytes)"
+    default 256
+    depends on ZMK_ESB_ENDPOINT_SHELL_RELAY
+
+config ZMK_ESB_ENDPOINT_SHELL_OUT_BUF_SIZE
+    int "Shell output ring buffer size (bytes)"
+    default 2048
+    depends on ZMK_ESB_ENDPOINT_SHELL_RELAY
+
+config ZMK_ESB_ENDPOINT_SHELL_PROMPT
+    string "Shell prompt string"
+    default SHELL_PROMPT_UART
+    depends on ZMK_ESB_ENDPOINT_SHELL_RELAY
+
+config SHELL_BACKEND_DUMMY_BUF_SIZE
+    default 2048 if ZMK_ESB_ENDPOINT_SHELL_RELAY

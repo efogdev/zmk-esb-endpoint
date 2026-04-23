@@ -1,0 +1,8 @@
+# Copyright (c) 2025 efogdev
+# SPDX-License-Identifier: MIT
+
+description: ESB unpair behavior
+
+compatible: "zmk,behavior-esb-unpair"
+
+include: zero_param.yaml
