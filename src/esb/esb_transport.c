@@ -77,6 +77,23 @@ static struct k_work rx_work;
 static uint8_t rx_buf[ESB_MAX_PAYLOAD_LEN];
 static uint8_t rx_len;
 
+static uint32_t tx_ok_count;
+static uint32_t tx_fail_count;
+static uint32_t consecutive_tx_fail;
+
+/*
+ * On TX_FAILED the ESB library leaves the failed payload in the TX FIFO and
+ * sets state to IDLE — it does NOT auto-restart.  esb_write_payload() with
+ * TXMODE_AUTO only calls start_tx_transaction() on a successful enqueue, so
+ * once the FIFO fills with unacknowledged payloads every write returns -ENOMEM
+ * and the radio stays DISABLED.  We call esb_start_tx() after each TX_FAILED
+ * to retry immediately and keep the FIFO from saturating.
+ */
+#define CONSECUTIVE_WARN_THRESHOLD 5
+#define CONSECUTIVE_ERR_THRESHOLD  20
+
+static int esb_init_and_configure(void);
+
 static void rx_work_fn(struct k_work *w) {
     if (!m_cb) {
         return;
@@ -90,12 +107,10 @@ static void rx_work_fn(struct k_work *w) {
 }
 
 static void zmk_esb_transport_evt_cb(struct esb_evt const *event) {
-    static uint32_t tx_ok_count;
-    static uint32_t tx_fail_count;
-
     switch (event->evt_id) {
     case ESB_EVENT_TX_SUCCESS:
         tx_ok_count++;
+        consecutive_tx_fail = 0;
 #if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_SHELL_RELAY)
         esb_shell_relay_notify_tx();
 #endif
@@ -103,9 +118,13 @@ static void zmk_esb_transport_evt_cb(struct esb_evt const *event) {
 
     case ESB_EVENT_TX_FAILED:
         tx_fail_count++;
-        if ((tx_fail_count % 10u) == 0u) {
-            LOG_WRN("ESB TX_FAILED count=%u (ok=%u)", tx_fail_count, tx_ok_count);
+        consecutive_tx_fail++;
+        if (consecutive_tx_fail == CONSECUTIVE_WARN_THRESHOLD) {
+            LOG_WRN("ESB: %u consecutive TX failures (ok=%u)", consecutive_tx_fail, tx_ok_count);
+        } else if (consecutive_tx_fail == CONSECUTIVE_ERR_THRESHOLD) {
+            LOG_ERR("ESB: %u consecutive TX failures (ok=%u)", consecutive_tx_fail, tx_ok_count);
         }
+        esb_start_tx();
         break;
 
     case ESB_EVENT_RX_RECEIVED:
@@ -126,24 +145,26 @@ static int esb_init_and_configure(void) {
     cfg.protocol           = ESB_PROTOCOL_ESB_DPL;
     cfg.mode               = ESB_MODE_PTX;
     cfg.bitrate            = ESB_BITRATE_2MBPS;
-    cfg.crc                = ESB_CRC_8BIT;
+    cfg.crc                = ESB_CRC_16BIT;
     cfg.retransmit_count   = CONFIG_ZMK_ESB_ENDPOINT_RETRANSMIT_COUNT;
     cfg.retransmit_delay   = CONFIG_ZMK_ESB_ENDPOINT_RETRANSMIT_DELAY_US;
     cfg.tx_mode            = ESB_TXMODE_AUTO;
     cfg.use_fast_ramp_up   = true;
+    cfg.tx_output_power    = ESB_TX_POWER_8DBM;
     cfg.selective_auto_ack = IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_HID_NOACK);
     cfg.event_handler      = zmk_esb_transport_evt_cb;
     cfg.payload_length     = ESB_MAX_PAYLOAD_LEN;
 
     const int err = esb_init(&cfg);
     if (err) {
+        LOG_ERR("esb_init failed: %d", err);
         return err;
     }
 
     if (m_addr.configured) {
         esb_set_base_address_0(m_addr.base0);
         esb_set_base_address_1(m_addr.base1);
-        esb_set_prefixes(m_addr.prefixes, ARRAY_SIZE(m_addr.prefixes));
+        esb_set_prefixes(m_addr.prefixes, 2);
         esb_set_rf_channel(m_addr.channel);
     }
 
@@ -164,6 +185,8 @@ static void install_ram_vtor(void) {
     __ISB();
     irq_unlock(key);
     m_ram_vtor_installed = true;
+    LOG_DBG("RAM VTOR installed at 0x%08x, saved RADIO vector=0x%08x",
+            (uint32_t)m_ram_vtor, saved_radio_vector);
 }
 
 int esb_transport_init(const esb_transport_cb_t cb) {
@@ -209,6 +232,10 @@ int esb_transport_send(const uint8_t pipe, const uint8_t *data, uint8_t len) {
         .noack  = noack ? 1U : 0U,
     };
     memcpy(pkt.data, data, len);
+
+    if (esb_tx_full()) {
+        esb_flush_tx();
+    }
     return esb_write_payload(&pkt);
 }
 
@@ -222,6 +249,7 @@ static void bt_ll_suspend(void) {
     saved_bt_ll_ppi_chen = NRF_PPI->CHEN & BT_LL_PPI_MASK;
     NRF_PPI->CHENCLR = BT_LL_PPI_MASK;
     bt_ll_suspended = true;
+    LOG_DBG("BT LL PPI suspended (saved CHEN=0x%08x)", saved_bt_ll_ppi_chen);
 }
 
 static void bt_ll_resume(void) {
@@ -230,6 +258,7 @@ static void bt_ll_resume(void) {
     }
     NRF_PPI->CHENSET = saved_bt_ll_ppi_chen;
     bt_ll_suspended = false;
+    LOG_DBG("BT LL PPI resumed (restored CHEN=0x%08x)", saved_bt_ll_ppi_chen);
 }
 
 /*
@@ -252,6 +281,7 @@ static int hfxo_request(void) {
     sys_notify_init_spinwait(&hfclk_cli.notify);
     const int err = onoff_request(mgr, &hfclk_cli);
     if (err < 0) {
+        LOG_ERR("HFXO onoff_request failed: %d", err);
         return err;
     }
     int res;
@@ -259,6 +289,11 @@ static int hfxo_request(void) {
         k_busy_wait(10);
     }
     hfclk_held = (res == 0);
+    if (!hfclk_held) {
+        LOG_ERR("HFXO start failed: %d", res);
+    } else {
+        LOG_DBG("HFXO running (HFCLKSTAT=0x%08x)", NRF_CLOCK->HFCLKSTAT);
+    }
     return res;
 }
 
@@ -270,13 +305,20 @@ static void hfxo_release(void) {
         z_nrf_clock_control_get_onoff(CLOCK_CONTROL_NRF_SUBSYS_HF);
     (void)onoff_release(mgr);
     hfclk_held = false;
+    LOG_DBG("HFXO released");
 }
 
 void esb_transport_on_slot_start(void) {
+    LOG_INF("ESB slot start (HFCLKSTAT=0x%08x PPI_CHEN=0x%08x)",
+            NRF_CLOCK->HFCLKSTAT, NRF_PPI->CHEN);
     bt_ll_suspend();
-    hfxo_request();
-    const int err = esb_init_and_configure();
-    if (err) {
+    const int hfxo_err = hfxo_request();
+    if (hfxo_err) {
+        LOG_ERR("ESB slot start: HFXO failed (%d), radio may be unreliable", hfxo_err);
+    }
+    const int init_err = esb_init_and_configure();
+    if (init_err) {
+        LOG_ERR("ESB slot start: init failed (%d)", init_err);
         return;
     }
 
@@ -289,13 +331,21 @@ void esb_transport_on_slot_start(void) {
      */
     {
         const unsigned int key = irq_lock();
-        m_ram_vtor[16 + RADIO_IRQn] = (uint32_t) z_arm_irq_direct_dynamic_dispatch_reschedule;
+        m_ram_vtor[16 + RADIO_IRQn] =
+            (uint32_t)z_arm_irq_direct_dynamic_dispatch_reschedule;
         __DSB();
         irq_unlock(key);
     }
+
+    consecutive_tx_fail = 0;
+    LOG_INF("ESB slot start OK (VTOR[RADIO]=0x%08x)",
+            m_ram_vtor[16 + RADIO_IRQn]);
 }
 
 void esb_transport_on_slot_stop(void) {
+    LOG_INF("ESB slot stop (ok=%u fail=%u)", tx_ok_count, tx_fail_count);
+    consecutive_tx_fail = 0;
+
     esb_disable();
 
     if (m_ram_vtor_installed) {
@@ -304,6 +354,7 @@ void esb_transport_on_slot_stop(void) {
         __DSB();
         irq_unlock(key);
         irq_enable(RADIO_IRQn);
+        LOG_DBG("VTOR[RADIO] restored to 0x%08x", saved_radio_vector);
     }
 
     bt_ll_resume();

@@ -31,22 +31,22 @@ if ESB
 
 config ESB_MAX_PAYLOAD_LENGTH
     int "Maximum ESB payload size"
-    default 32
+    default 24
     range 1 252
 
 config ESB_TX_FIFO_SIZE
     int "ESB TX FIFO depth"
-    default 16 if ZMK_ESB_ENDPOINT_SHELL_RELAY
-    default 4
+    default 24 if ZMK_ESB_ENDPOINT_SHELL_RELAY
+    default 8
 
 config ESB_RX_FIFO_SIZE
     int "ESB RX FIFO depth"
-    default 16 if ZMK_ESB_ENDPOINT_SHELL_RELAY
-    default 4
+    default 24 if ZMK_ESB_ENDPOINT_SHELL_RELAY
+    default 8
 
 config ESB_PIPE_COUNT
     int "ESB pipe count"
-    default 6
+    default 2
     range 1 8
 
 config ESB_RADIO_IRQ_PRIORITY
@@ -118,13 +118,13 @@ config ZMK_ESB_ENDPOINT_RETRANSMIT_COUNT
 
 config ZMK_ESB_ENDPOINT_RETRANSMIT_DELAY_US
     int "ESB retransmit delay (microseconds)"
-    default 330
+    default 350
     help
       Must be > ramp_up(40us) + ack_timeout(160us) + processing latency.
 
 config ZMK_ESB_ENDPOINT_BEACON_INTERVAL_MS
     int "Pairing beacon interval (milliseconds)"
-    default 100
+    default 50
     range 10 1000
     help
       How often the keyboard broadcasts PAIR beacons while unpaired.
