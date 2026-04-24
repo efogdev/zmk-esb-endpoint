@@ -12,6 +12,7 @@ typedef enum {
     PAIRING_STATE_IDLE,
     PAIRING_STATE_UNPAIRED,
     PAIRING_STATE_PAIRING,
+    PAIRING_STATE_VERIFYING,  /* has stored peer, awaiting device_id match */
     PAIRING_STATE_CONNECTED,
 } pairing_state_t;
 

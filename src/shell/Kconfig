@@ -42,5 +42,43 @@ config ZMK_ESB_ENDPOINT_SHELL_PROMPT
     default SHELL_PROMPT_UART
     depends on ZMK_ESB_ENDPOINT_SHELL_RELAY
 
+config ZMK_ESB_ENDPOINT_SHELL_BG_POLL
+    bool "Send SHELL_BG_POLL keepalives while shell is idle"
+    default y
+    depends on ZMK_ESB_ENDPOINT_SHELL_RELAY
+    help
+      When paired but no shell session is active, send periodic
+      SHELL_BG_POLL packets to keep the ACK pipeline open so a dongle
+      SHELL_REQ is delivered promptly. Disable to avoid any idle-time
+      ESB TX; the dongle will then only reach the keyboard via ACKs on
+      HID or other ESB traffic the keyboard initiates.
+
+config ZMK_ESB_ENDPOINT_SHELL_BG_POLL_MS
+    int "Background ACK poll interval while shell is idle (ms)"
+    default 500
+    range 100 5000
+    depends on ZMK_ESB_ENDPOINT_SHELL_BG_POLL
+    help
+      How often SHELL_BG_POLL is sent while paired and no shell session
+      is active.
+
+config ZMK_ESB_ENDPOINT_SHELL_BG_POLL_ACTIVITY_THRESHOLD_MS
+    int "Background ACK poll activity threshold (ms)"
+    default 5000
+    range 0 3600000
+    depends on ZMK_ESB_ENDPOINT_SHELL_BG_POLL
+    help
+      Gate the background poll on recent ESB traffic: if no non-bg-poll ESB
+      TX or RX has occurred within this many milliseconds, the periodic
+      SHELL_BG_POLL is suppressed. The work keeps rescheduling so polling
+      resumes automatically on the next TX/RX. Set to 0 to disable gating
+      (always poll while paired).
+
+config ZMK_ESB_ENDPOINT_SHELL_INITIAL_POLL_DELAY_MS
+    int "Initial shell poll delay after SHELL_REQ received (ms)"
+    default 20
+    range 5 500
+    depends on ZMK_ESB_ENDPOINT_SHELL_RELAY
+
 config SHELL_BACKEND_DUMMY_BUF_SIZE
     default 2048 if ZMK_ESB_ENDPOINT_SHELL_RELAY

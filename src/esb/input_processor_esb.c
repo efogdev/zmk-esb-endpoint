@@ -44,7 +44,7 @@ static void send_mouse_report(struct esb_ip_data *d) {
         .report_type = ESB_REPORT_MOUSE,
     };
     memcpy(pkt.data, &body, sizeof(body));
-    esb_transport_send(1, (uint8_t *)&pkt, sizeof(pkt));
+    esb_transport_send(ESB_PIPE_DATA, (uint8_t *)&pkt, sizeof(pkt));
     d->dx = d->dy = d->scroll_x = d->scroll_y = 0;
 }
 
@@ -55,6 +55,7 @@ static int esb_ip_handle_event(const struct device *dev, struct input_event *eve
     }
 
     struct esb_ip_data *d = dev->data;
+    bool button_changed = false;
     switch (event->type) {
     case INPUT_EV_REL:
         switch (event->code) {
@@ -76,17 +77,19 @@ static int esb_ip_handle_event(const struct device *dev, struct input_event *eve
     case INPUT_EV_KEY:
         if (event->code >= INPUT_BTN_0 && event->code <= INPUT_BTN_4) {
             const uint8_t btn = event->code - INPUT_BTN_0;
+            const uint8_t before = d->buttons;
             if (event->value) {
                 d->buttons |= BIT(btn);
             } else {
                 d->buttons &= ~BIT(btn);
             }
+            button_changed = (d->buttons != before);
         }
         break;
     default: break;
     }
 
-    if (event->sync) {
+    if (event->sync || button_changed) {
         send_mouse_report(d);
     }
 

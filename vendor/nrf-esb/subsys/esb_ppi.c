@@ -218,10 +218,12 @@ int esb_ppi_init(void)
 	}
 
 	if (IS_ENABLED(CONFIG_ESB_NEVER_DISABLE_TX)) {
-		err = nrfx_ppi_channel_alloc(&radio_end_timer_start);
-		if (err != NRFX_SUCCESS) {
-			goto error;
-		}
+		/* The nrfx pool only covers channels 0-5 (BT_LL reserves 6-19).
+		 * esb_transport_on_slot_start() suspends BT_LL by clearing all
+		 * BT_LL_PPI_MASK CHEN bits before calling esb_init(), so channel 6
+		 * is hardware-disabled and unused while ESB is active.  Borrow it
+		 * directly instead of going through the exhausted nrfx allocator. */
+		radio_end_timer_start = NRF_PPI_CHANNEL6;
 	}
 
 	err = nrfx_ppi_group_alloc(&ramp_up_ppi_group);
@@ -291,10 +293,8 @@ void esb_ppi_deinit(void)
 	}
 
 	if (IS_ENABLED(CONFIG_ESB_NEVER_DISABLE_TX)) {
-		err = nrfx_ppi_channel_free(radio_end_timer_start);
-		if (err != NRFX_SUCCESS) {
-			goto error;
-		}
+		/* Zero borrowed channel endpoints so BT_LL gets a clean slate. */
+		nrf_ppi_channel_endpoint_setup(NRF_PPI, radio_end_timer_start, 0, 0);
 	}
 
 	err = nrfx_ppi_group_free(ramp_up_ppi_group);

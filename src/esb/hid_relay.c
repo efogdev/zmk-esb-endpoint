@@ -126,7 +126,7 @@ static void send_keyboard(void) {
         body_len = sizeof(pkt.data);
     }
     memcpy(pkt.data, &kb_body, body_len);
-    const int err = esb_transport_send(1, (uint8_t *)&pkt, sizeof(pkt));
+    const int err = esb_transport_send(ESB_PIPE_DATA, (uint8_t *)&pkt, sizeof(pkt));
     if (err && err != -ENOMEM) {
         LOG_WRN("KB report send err %d", err);
     }
@@ -142,7 +142,7 @@ static void send_consumer(void) {
         body_len = sizeof(pkt.data);
     }
     memcpy(pkt.data, &cons_body, body_len);
-    const int err = esb_transport_send(1, (uint8_t *)&pkt, sizeof(pkt));
+    const int err = esb_transport_send(ESB_PIPE_DATA, (uint8_t *)&pkt, sizeof(pkt));
     if (err && err != -ENOMEM) {
         LOG_WRN("consumer report send err %d", err);
     }

@@ -10,10 +10,10 @@
  *     The dongle uses the ACK to deliver queued user input.
  *   - Received SHELL_DATA bytes are accumulated until a newline, then executed
  *     via the Zephyr dummy shell backend (same approach as zmk-ble-shell).
- *   - Command output is fragmented into 30-byte SHELL_DATA TX packets sent
+ *   - Command output is fragmented into SHELL_DATA TX packets sent
  *     back to the dongle. An output ring buffer handles backpressure when the
  *     ESB TX FIFO is full; draining resumes on TX_SUCCESS (notify_tx).
- *   - An inactivity timer (60s default) fires if no command bytes arrive;
+ *   - An inactivity timer fires if no command bytes arrive;
  *     the keyboard then sends SHELL_STOP and exits shell mode.
  */
 
@@ -24,6 +24,7 @@
 #include <string.h>
 
 #include <zmk_esb/protocol.h>
+#include <zmk_esb/endpoint.h>
 #include "esb_transport.h"
 #include "shell_relay.h"
 
@@ -42,15 +43,19 @@ static void shell_exec_work_fn(struct k_work *w);
 static void shell_poll_work_fn(struct k_work *w);
 static void inactivity_work_fn(struct k_work *w);
 static void out_drain_work_fn(struct k_work *w);
+#if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_SHELL_BG_POLL)
 static void bg_poll_work_fn(struct k_work *w);
+#endif
 
 static K_WORK_DEFINE(shell_exec_work, shell_exec_work_fn);
 static K_WORK_DELAYABLE_DEFINE(shell_poll_work, shell_poll_work_fn);
 static K_WORK_DELAYABLE_DEFINE(inactivity_work, inactivity_work_fn);
 static K_WORK_DEFINE(out_drain_work, out_drain_work_fn);
+#if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_SHELL_BG_POLL)
 static K_WORK_DELAYABLE_DEFINE(bg_poll_work, bg_poll_work_fn);
+#endif
 
-static void out_enqueue(const uint8_t *data, size_t len) {
+static void out_enqueue(const uint8_t *data, const size_t len) {
     const uint32_t put = ring_buf_put(&out_rb, data, (uint32_t)len);
     if (put < len) {
         LOG_WRN("out_rb full: dropped %zu bytes", len - put);
@@ -83,7 +88,7 @@ static void out_drain_work_fn(struct k_work *w) {
         memcpy(pkt.data, chunk, got);
         memset(pkt.data + got, 0, sizeof(pkt.data) - got);
 
-        const int err = esb_transport_send(1, (uint8_t *)&pkt, sizeof(pkt));
+        const int err = esb_transport_send(ESB_PIPE_DATA, (uint8_t *)&pkt, sizeof(pkt));
         if (err == -ENOMEM) {
             LOG_DBG("shell TX FIFO full, %u bytes deferred", got);
             ring_buf_get_finish(&out_rb, 0);
@@ -121,7 +126,7 @@ static void shell_exec_work_fn(struct k_work *w) {
     }
     *end = '\0';
 
-    LOG_DBG("ESB shell: exec '%s'", start);
+    LOG_DBG("exec '%s'", start);
 
     const struct shell *sh = shell_backend_dummy_get_ptr();
     shell_backend_dummy_clear_output(sh);
@@ -130,19 +135,16 @@ static void shell_exec_work_fn(struct k_work *w) {
     size_t out_len;
     const char *out = shell_backend_dummy_get_output(sh, &out_len);
 
-    LOG_DBG("ESB shell: ret=%d out_len=%zu", ret, out_len);
+    LOG_DBG("ret=%d out_len=%zu", ret, out_len);
     if (ret == -ENOEXEC) {
-        char msg[CONFIG_ZMK_ESB_ENDPOINT_SHELL_CMD_BUF_SIZE + 24];
-        const int n = snprintk(msg, sizeof(msg), ";31m%s: command not found", start);
+        char msg[CONFIG_ZMK_ESB_ENDPOINT_SHELL_CMD_BUF_SIZE + 32];
+        const int n = snprintk(msg, sizeof(msg), "\r\n\033[31m%s: command not found\033[0m", start);
         if (n > 0) {
             out_enqueue((const uint8_t *)msg, (size_t)n);
         }
     } else {
         if (out_len > 0) {
             out_enqueue((const uint8_t *)out, out_len);
-        }
-        if (ret != 0) {
-            out_enqueue((const uint8_t *)"\r\n", 2);
         }
     }
 
@@ -155,7 +157,7 @@ static void shell_poll_work_fn(struct k_work *w) {
         return;
     }
     struct esb_pkt_shell_poll pkt = { .type = ESB_PKT_SHELL_POLL };
-    const int err = esb_transport_send(1, (uint8_t *)&pkt, sizeof(pkt));
+    const int err = esb_transport_send(ESB_PIPE_DATA, (uint8_t *)&pkt, sizeof(pkt));
     if (err && err != -ENOMEM) {
         LOG_DBG("SHELL_POLL TX err %d", err);
     }
@@ -164,37 +166,51 @@ static void shell_poll_work_fn(struct k_work *w) {
 
 static void inactivity_work_fn(struct k_work *w) {
     ARG_UNUSED(w);
-    LOG_DBG("ESB shell relay: inactivity timeout (%ds), stopping",
+    LOG_DBG("inactivity timeout (%ds), stopping",
             CONFIG_ZMK_ESB_ENDPOINT_SHELL_INACTIVITY_S);
     m_shell_active = false;
     k_work_cancel_delayable(&shell_poll_work);
     ring_buf_reset(&out_rb);
     struct esb_pkt_shell_stop pkt = { .type = ESB_PKT_SHELL_STOP };
-    esb_transport_send(1, (uint8_t *)&pkt, sizeof(pkt));
+    esb_transport_send(ESB_PIPE_DATA, (uint8_t *)&pkt, sizeof(pkt));
 }
 
+#if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_SHELL_BG_POLL)
 static void bg_poll_work_fn(struct k_work *w) {
     ARG_UNUSED(w);
     if (m_shell_active) {
         return;
     }
-    struct esb_pkt_shell_poll pkt = { .type = ESB_PKT_SHELL_POLL };
-    esb_transport_send(1, (uint8_t *)&pkt, sizeof(pkt));
-    k_work_reschedule(&bg_poll_work, K_MSEC(500));
+    const uint32_t threshold = CONFIG_ZMK_ESB_ENDPOINT_SHELL_BG_POLL_ACTIVITY_THRESHOLD_MS;
+    if (threshold == 0 || esb_transport_ms_since_activity() <= threshold) {
+        struct esb_pkt_shell_bg_poll pkt = { .type = ESB_PKT_SHELL_BG_POLL };
+        esb_transport_send(ESB_PIPE_DATA, (uint8_t *)&pkt, sizeof(pkt));
+    }
+    k_work_reschedule(&bg_poll_work, K_MSEC(CONFIG_ZMK_ESB_ENDPOINT_SHELL_BG_POLL_MS));
 }
+#endif
 
-void esb_shell_relay_init(void) {
-    LOG_DBG("ESB shell relay: init");
-}
+void esb_shell_relay_init(void) {}
 
 void esb_shell_relay_on_connected(void) {
-    LOG_DBG("ESB shell relay: connected, starting background ACK poll");
-    k_work_reschedule(&bg_poll_work, K_MSEC(500));
+    LOG_DBG("connected, resetting shell state");
+    m_shell_active = false;
+    k_work_cancel_delayable(&shell_poll_work);
+    k_work_cancel_delayable(&inactivity_work);
+    ring_buf_reset(&out_rb);
+    k_mutex_lock(&cmd_mutex, K_FOREVER);
+    cmd_len = 0;
+    k_mutex_unlock(&cmd_mutex);
+#if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_SHELL_BG_POLL)
+    k_work_reschedule(&bg_poll_work, K_MSEC(CONFIG_ZMK_ESB_ENDPOINT_SHELL_BG_POLL_MS));
+#endif
 }
 
 void esb_shell_relay_on_disconnected(void) {
-    LOG_DBG("ESB shell relay: disconnected");
+    LOG_DBG("disconnected");
+#if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_SHELL_BG_POLL)
     k_work_cancel_delayable(&bg_poll_work);
+#endif
     if (!m_shell_active) {
         return;
     }
@@ -206,15 +222,17 @@ void esb_shell_relay_on_disconnected(void) {
 
 void esb_shell_relay_on_req(void) {
     if (m_shell_active) {
-        LOG_DBG("ESB shell relay: SHELL_REQ but already active");
+        LOG_DBG("SHELL_REQ but already active");
         return;
     }
-    LOG_DBG("ESB shell relay: SHELL_REQ received, starting");
+    LOG_DBG("SHELL_REQ received, entering active shell mode");
     m_shell_active = true;
     cmd_len = 0;
     ring_buf_reset(&out_rb);
+#if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_SHELL_BG_POLL)
     k_work_cancel_delayable(&bg_poll_work);
-    k_work_reschedule(&shell_poll_work, K_MSEC(20));
+#endif
+    k_work_reschedule(&shell_poll_work, K_MSEC(CONFIG_ZMK_ESB_ENDPOINT_SHELL_INITIAL_POLL_DELAY_MS));
     if (CONFIG_ZMK_ESB_ENDPOINT_SHELL_INACTIVITY_S > 0) {
         k_work_reschedule(&inactivity_work, K_SECONDS(CONFIG_ZMK_ESB_ENDPOINT_SHELL_INACTIVITY_S));
     }
@@ -223,10 +241,25 @@ void esb_shell_relay_on_req(void) {
 
 void esb_shell_relay_on_data(const uint8_t *data, const uint8_t len) {
     if (!m_shell_active || len == 0) {
-        LOG_DBG("ESB shell: SHELL_DATA ignored (active=%d len=%u)", m_shell_active, len);
+        LOG_DBG("SHELL_DATA ignored (active=%d len=%u)", m_shell_active, len);
+        if (!m_shell_active && len > 0) {
+            /* Dongle thinks the session is live (typical case: keyboard rebooted
+             * mid-session, dongle's m_active/m_keyboard_confirmed survived). Nudge
+             * it with SHELL_STOP so its always-on handler resets and re-issues
+             * SHELL_REQ; without this the dongle keeps queuing CDC bytes as
+             * SHELL_DATA ACK payloads until the FIFO fills (-ENOMEM) and input
+             * is dropped. Cooldown debounces a burst of in-flight payloads. */
+            static int64_t last_nudge_ms;
+            const int64_t now = k_uptime_get();
+            if (now - last_nudge_ms > 1000) {
+                last_nudge_ms = now;
+                struct esb_pkt_shell_stop pkt = { .type = ESB_PKT_SHELL_STOP };
+                esb_transport_send(ESB_PIPE_DATA, (uint8_t *)&pkt, sizeof(pkt));
+            }
+        }
         return;
     }
-    LOG_DBG("ESB shell: RX %u cmd bytes from dongle", len);
+    LOG_DBG("RX %u cmd bytes from dongle", len);
     if (CONFIG_ZMK_ESB_ENDPOINT_SHELL_INACTIVITY_S > 0) {
         k_work_reschedule(&inactivity_work, K_SECONDS(CONFIG_ZMK_ESB_ENDPOINT_SHELL_INACTIVITY_S));
     }
@@ -238,14 +271,14 @@ void esb_shell_relay_on_data(const uint8_t *data, const uint8_t len) {
                 cmd_buf[cmd_len] = '\0';
                 cmd_len = 0;
                 k_mutex_unlock(&cmd_mutex);
-                LOG_DBG("ESB shell: command ready, submitting exec work");
+                LOG_DBG("command ready, submitting exec work");
                 k_work_submit(&shell_exec_work);
                 k_mutex_lock(&cmd_mutex, K_FOREVER);
             }
         } else if (cmd_len < sizeof(cmd_buf) - 1) {
             cmd_buf[cmd_len++] = (char)b;
         } else {
-            LOG_WRN("ESB shell: cmd_buf overflow, byte 0x%02x dropped", b);
+            LOG_WRN("cmd_buf overflow, byte 0x%02x dropped", b);
         }
     }
     k_mutex_unlock(&cmd_mutex);
@@ -257,7 +290,26 @@ bool esb_shell_relay_is_active(void) {
 
 void esb_shell_relay_notify_tx(void) {
     if (m_shell_active && ring_buf_size_get(&out_rb) > 0) {
-        LOG_DBG("ESB shell: notify_tx, %u bytes pending", ring_buf_size_get(&out_rb));
+        LOG_DBG("notify_tx, %u bytes pending", ring_buf_size_get(&out_rb));
         k_work_submit(&out_drain_work);
     }
+}
+
+int esb_shell_relay_request(void) {
+    if (!zmk_esb_endpoint_is_active()) {
+        LOG_DBG("SHELL_START ignored, ESB endpoint not active");
+        return -ENOTCONN;
+    }
+    if (m_shell_active) {
+        LOG_DBG("SHELL_START ignored, already in shell mode");
+        return 0;
+    }
+    const struct esb_pkt_shell_start pkt = { .type = ESB_PKT_SHELL_START };
+    const int err = esb_transport_send(ESB_PIPE_DATA, (const uint8_t *)&pkt, sizeof(pkt));
+    if (err) {
+        LOG_WRN("SHELL_START TX err %d", err);
+    } else {
+        LOG_DBG("SHELL_START sent to dongle");
+    }
+    return err;
 }

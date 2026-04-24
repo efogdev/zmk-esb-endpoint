@@ -1,0 +1,8 @@
+# Copyright (c) 2025 efogdev
+# SPDX-License-Identifier: MIT
+
+description: ESB shell relay request behavior
+
+compatible: "zmk,behavior-esb-shell-req"
+
+include: zero_param.yaml

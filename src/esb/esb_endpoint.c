@@ -20,6 +20,13 @@
 #if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_SHELL_RELAY)
 #include "../shell/shell_relay.h"
 #endif
+#if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_BENCH)
+#include "bench.h"
+#endif
+#if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_HOP)
+#include "channel_hop_ep.h"
+#include <zmk_esb/channel_hop.h>
+#endif
 
 #include <zephyr/logging/log.h>
 #if IS_ENABLED(CONFIG_SHELL)
@@ -41,7 +48,7 @@ static struct k_thread esb_ctrl_thread;
 
 #define ESB_CMD_ACTIVATE   1
 #define ESB_CMD_DEACTIVATE 2
-K_MSGQ_DEFINE(esb_ctrl_msgq, sizeof(int), 4, 4);
+K_MSGQ_DEFINE(esb_ctrl_msgq, sizeof(int), CONFIG_ZMK_ESB_ENDPOINT_CTRL_MSGQ_DEPTH, 4);
 
 bool zmk_esb_endpoint_is_active(void) {
     return esb_active;
@@ -62,6 +69,9 @@ static void configure_esb_addresses(void) {
 static void on_transport_evt(const esb_transport_evt_t *evt) {
     if (evt->type == ESB_RX_EVT) {
         pairing_on_rx(evt->rx_buf, evt->rx_len);
+#if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_BENCH)
+        esb_bench_on_rx(evt->rx_buf, evt->rx_len);
+#endif
     }
 }
 
@@ -146,10 +156,19 @@ static void esb_ctrl_thread_fn(void *p1, void *p2, void *p3) {
             esb_transport_on_slot_stop();
             pairing_stop();
             esb_transport_deinit();
-            /* Force-sync BT state: ZMK thinks adv is running (our wrap returned
-             * 0 on its last bt_le_adv_start). Real stop + let the next
-             * profile_changed event's update_advertising_work re-evaluate. */
-            bt_le_adv_stop();
+            /* Resync ZMK's static advertising_status with reality. Our wrap
+             * returned 0 on the last bt_le_adv_start, so ZMK believes adv is
+             * running; a bare bt_le_adv_stop() here would not flip that state
+             * and update_advertising() would then no-op (desired==current==CONN),
+             * leaving the new BLE slot unreachable. zmk_ble_set_device_name()
+             * with CONFIG_BT_DEVICE_NAME is idempotent on bt_set_name() and
+             * runs the exact reset path we need: stops adv, clears
+             * advertising_status to NONE, then calls update_advertising() which
+             * starts adv for real (esb_active is now false, so the wrap is
+             * transparent). zmk_ble_active_profile_name() would return an empty
+             * string — ZMK never populates profiles[i].name — which bt_set_name()
+             * would then apply, making the device advertise without a name. */
+            zmk_ble_set_device_name((char *)CONFIG_BT_DEVICE_NAME);
         }
     }
 }
@@ -194,9 +213,12 @@ static int esb_endpoint_init(void) {
 #if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_SHELL_RELAY)
     esb_shell_relay_init();
 #endif
+#if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_HOP)
+    channel_hop_ep_init();
+#endif
 
     k_thread_create(&esb_ctrl_thread, esb_ctrl_stack, K_THREAD_STACK_SIZEOF(esb_ctrl_stack),
-                    esb_ctrl_thread_fn, NULL, NULL, NULL, K_PRIO_COOP(7), 0, K_NO_WAIT);
+                    esb_ctrl_thread_fn, NULL, NULL, NULL, K_PRIO_COOP(CONFIG_ZMK_ESB_ENDPOINT_CTRL_THREAD_PRIORITY), 0, K_NO_WAIT);
     k_thread_name_set(&esb_ctrl_thread, "esb_ctrl");
 
     k_work_schedule(&boot_profile_check_work, K_MSEC(CONFIG_ZMK_ESB_ENDPOINT_BOOT_CHECK_DELAY_MS));
@@ -210,12 +232,87 @@ static int cmd_esb_unpair(const struct shell *sh, const size_t argc, char **argv
     ARG_UNUSED(argc);
     ARG_UNUSED(argv);
     pairing_unpair();
-    shell_print(sh, "ESB: dongle forgotten, beaconing");
     return 0;
 }
 
+#if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_BENCH)
+static int cmd_esb_bench(const struct shell *sh, const size_t argc, char **argv) {
+    ARG_UNUSED(argc);
+    ARG_UNUSED(argv);
+    switch (esb_bench_get_state()) {
+    case BENCH_IDLE:
+        if (!zmk_esb_endpoint_is_active()) {
+            shell_error(sh, "ESB not active");
+            return -EINVAL;
+        }
+        esb_bench_start();
+        shell_print(sh, "ESB benchmark started (10 s)");
+        break;
+    case BENCH_RUNNING:
+        break;
+    case BENCH_STOPPING:
+        shell_print(sh, "Benchmark stopping, waiting for dongle result...");
+        break;
+    case BENCH_DONE: {
+        struct esb_bench_result r;
+        esb_bench_get_result(&r);
+        shell_print(sh, "Throughput: %u pkt/s  (ok=%u fail=%u)",
+                    r.throughput_pkt_s, r.tx_ok, r.tx_fail);
+        if (r.rssi_samples > 0) {
+            shell_print(sh, "RSSI: avg=%d dBm  min=%d  max=%d  n=%u",
+                        (int)r.rssi_avg, (int)r.rssi_min, (int)r.rssi_max,
+                        r.rssi_samples);
+        } else {
+            shell_print(sh, "RSSI: n/a (no dongle response)");
+        }
+        esb_bench_reset();
+        break;
+    }
+    }
+    return 0;
+}
+#endif /* CONFIG_ZMK_ESB_ENDPOINT_BENCH */
+
+#if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_HOP)
+static int cmd_esb_channel(const struct shell *sh, const size_t argc, char **argv) {
+    ARG_UNUSED(argc);
+    ARG_UNUSED(argv);
+    const uint8_t cur = esb_transport_get_channel();
+    const uint8_t nxt = channel_hop_ep_get_committed();
+    const uint8_t qn  = channel_hop_ep_get_quarantine_count();
+
+    shell_print(sh, "current:   %u", cur);
+    if (nxt == CHANNEL_HOP_INVALID) {
+        shell_print(sh, "committed: <none>");
+    } else {
+        shell_print(sh, "committed: %u", nxt);
+    }
+    shell_print(sh, "state:     %s",
+                channel_hop_ep_is_active() ? "active" : "idle");
+    shell_print(sh, "quarantined channels: %u", qn);
+    if (qn > 0) {
+        shell_fprintf(sh, SHELL_NORMAL, "  [");
+        bool first = true;
+        for (uint8_t ch = 0; ch < CHANNEL_HOP_CHANNEL_COUNT; ch++) {
+            if (channel_hop_ep_is_quarantined(ch)) {
+                shell_fprintf(sh, SHELL_NORMAL, "%s%u", first ? "" : ", ", ch);
+                first = false;
+            }
+        }
+        shell_print(sh, "]");
+    }
+    return 0;
+}
+#endif
+
 SHELL_STATIC_SUBCMD_SET_CREATE(esb_cmds,
     SHELL_CMD(unpair, NULL, "Forget paired dongle and start beaconing", cmd_esb_unpair),
+#if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_BENCH)
+    SHELL_CMD(bench, NULL, "Run ESB link benchmark (run twice: start, then read results)", cmd_esb_bench),
+#endif
+#if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_HOP)
+    SHELL_CMD(channel, NULL, "Show current RF channel, committed next hop, and quarantined channels", cmd_esb_channel),
+#endif
     SHELL_SUBCMD_SET_END
 );
 

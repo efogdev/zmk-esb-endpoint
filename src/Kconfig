@@ -36,12 +36,11 @@ config ESB_MAX_PAYLOAD_LENGTH
 
 config ESB_TX_FIFO_SIZE
     int "ESB TX FIFO depth"
-    default 24 if ZMK_ESB_ENDPOINT_SHELL_RELAY
+    default 16 if ZMK_ESB_ENDPOINT_SHELL_RELAY
     default 8
 
 config ESB_RX_FIFO_SIZE
     int "ESB RX FIFO depth"
-    default 24 if ZMK_ESB_ENDPOINT_SHELL_RELAY
     default 8
 
 config ESB_PIPE_COUNT
@@ -75,7 +74,7 @@ config ESB_DYNAMIC_INTERRUPTS
 
 config ESB_NEVER_DISABLE_TX
     bool
-    default n
+    default y
 
 config ESB_FAST_SWITCHING
     bool
@@ -109,7 +108,7 @@ config ZMK_ESB_ENDPOINT_HID_NOACK
 
 config ZMK_ESB_ENDPOINT_RETRANSMIT_COUNT
     int "ESB retransmit count for ACKed packets"
-    default 3
+    default 7
     range 0 15
     help
       Applies to control packets (BEACON/PAIR/DISCONNECT). HID reports sent
@@ -118,9 +117,7 @@ config ZMK_ESB_ENDPOINT_RETRANSMIT_COUNT
 
 config ZMK_ESB_ENDPOINT_RETRANSMIT_DELAY_US
     int "ESB retransmit delay (microseconds)"
-    default 350
-    help
-      Must be > ramp_up(40us) + ack_timeout(160us) + processing latency.
+    default 560
 
 config ZMK_ESB_ENDPOINT_BEACON_INTERVAL_MS
     int "Pairing beacon interval (milliseconds)"
@@ -129,9 +126,27 @@ config ZMK_ESB_ENDPOINT_BEACON_INTERVAL_MS
     help
       How often the keyboard broadcasts PAIR beacons while unpaired.
 
+config ZMK_ESB_ENDPOINT_BEACON_INITIAL_DELAY_MS
+    int "Initial beacon delay after activation or unpair (ms)"
+    default 10
+    range 0 500
+    help
+      How long to wait before sending the very first beacon after ESB
+      activates, after unpairing, or after a disconnect.
+
+config ZMK_ESB_ENDPOINT_VERIFY_INTERVAL_MS
+    int "Identity VERIFY_REQ retransmit interval (ms)"
+    default 250
+    range 50 2000
+    help
+      How often the keyboard sends ESB_PKT_VERIFY_REQ while in the VERIFYING
+      state (reconnect with a stored peer). A response with a matching
+      device_id transitions to CONNECTED; a mismatch keeps the keyboard in
+      VERIFYING indefinitely so HID stays suppressed against a stranger dongle.
+
 config ZMK_ESB_ENDPOINT_BOOT_CHECK_DELAY_MS
     int "Boot-time profile check delay (milliseconds)"
-    default 500
+    default 650
     range 100 10000
     help
       ZMK does not raise zmk_ble_active_profile_changed for the profile
@@ -153,7 +168,257 @@ config ZMK_ESB_ENDPOINT_CTRL_STACK_SIZE
     int "ESB control thread stack size (bytes)"
     default 2048
 
+config ZMK_ESB_ENDPOINT_CTRL_THREAD_PRIORITY
+    int "ESB control thread cooperative priority"
+    default 7
+    range 0 13
+
+config ZMK_ESB_ENDPOINT_CTRL_MSGQ_DEPTH
+    int "ESB control message queue depth"
+    default 3
+    range 2 16
+
+config ZMK_ESB_ENDPOINT_TX_FAIL_WARN_THRESHOLD
+    int "Consecutive TX failures before warning log"
+    default 1
+    range 1 100
+
+config ZMK_ESB_ENDPOINT_TX_FAIL_ERR_THRESHOLD
+    int "Consecutive TX failures before error log and TX flush"
+    default 2
+    range 1 100
+
+config ZMK_ESB_ENDPOINT_CHANNEL_HOP
+    bool "Dynamic channel hopping on TX failure"
+    default y
+    help
+      When enabled, the endpoint negotiates a "committed next channel"
+      with the dongle during healthy operation and hops to it when a
+      burst of TX failures indicates interference on the current channel.
+      The recently-bad channel is quarantined to prevent immediate reuse.
+
+if ZMK_ESB_ENDPOINT_CHANNEL_HOP
+
+config ZMK_ESB_ENDPOINT_CHANNEL_HOP_TX_FAIL_WINDOW_MS
+    int "Continuous TX-failure duration before triggering a channel hop (ms)"
+    default 85
+    range 2 1000
+    help
+      A channel hop fires once TX has been failing continuously for this
+      many milliseconds — i.e. at least one failure arrived, no TX_SUCCESS
+      has been seen since, and the window has elapsed. Using a time window
+      (rather than a raw packet count) makes the decision independent of
+      HID report rate and retransmit latency. Any TX_SUCCESS resets the
+      streak so the next hop evaluation starts fresh.
+
+config ZMK_ESB_ENDPOINT_CHANNEL_HOP_WEAK_LINK_MS
+    int "No-TX_SUCCESS duration before triggering a weak-link hop (ms)"
+    default 150
+    range 0 5000
+    help
+      Hop if no TX_SUCCESS has arrived for this long while actively
+      sending — even if some packets succeeded in between. Catches weak
+      links where the fail-window trigger
+      (CHANNEL_HOP_TX_FAIL_WINDOW_MS) never accumulates because
+      occasional successes keep resetting consecutive_tx_fail and
+      m_first_fail_ms, so the endpoint stays put while the dongle's
+      RX-silence watchdog hops alone and validation always fails. Must
+      be larger than TX_FAIL_WINDOW_MS so the fast dead-link path still
+      wins. Should be smaller than the dongle's
+      DONGLE_CHANNEL_HOP_RX_SILENCE_MS (default 300) so the endpoint
+      hops first and the dongle's silence watchdog can meet it on the
+      new channel. Set to 0 to disable.
+
+config ZMK_ESB_ENDPOINT_CHANNEL_HOP_POST_QUIET_MS
+    int "Post-hop quiet period before resuming TX (ms)"
+    default 3
+    range 0 1000
+    help
+      After a channel hop, suppress all outgoing traffic for this many
+      milliseconds. This gives the dongle's speculative-hop state machine
+      time to catch up on the new channel before we resume flooding it —
+      packets sent during this window would otherwise fail and feed right
+      back into the TX-fail accounting. The post-hop PROPOSAL burst is
+      also delayed by this amount so its first packet lands after the
+      dongle has had a chance to settle.
+
+config ZMK_ESB_ENDPOINT_CHANNEL_QUARANTINE_MS
+    int "Quarantine hold time for a bad channel (ms)"
+    default 30000
+    range 1000 600000
+    help
+      How long a channel stays in quarantine after a hop. Quarantined
+      channels are excluded from the candidate set for new hops, and the
+      area around them (see CHANNEL_QUARANTINE_MIN_DISTANCE) is also
+      avoided whenever possible.
+
+config ZMK_ESB_ENDPOINT_CHANNEL_QUARANTINE_MIN_DISTANCE
+    int "Minimum distance from any quarantined channel (MHz)"
+    default 5
+    range 0 20
+    help
+      New candidate channels must be at least this many steps away from
+      every quarantined channel. If no channel satisfies the full
+      distance, the selection progressively relaxes the distance (down
+      to adjacent, but never reusing a quarantined channel itself).
+
+config ZMK_ESB_ENDPOINT_CHANNEL_HOP_NEGOTIATE_INTERVAL_MS
+    int "Interval between channel-hop negotiation rounds (ms) — steady state"
+    default 60000
+    range 500 60000
+    help
+      How often the endpoint re-proposes a committed next channel while
+      committed_next is already populated. Lower values react faster to
+      quarantine changes but add background traffic.
+
+config ZMK_ESB_ENDPOINT_CHANNEL_HOP_NEGOTIATE_RETRY_MS
+    int "Negotiation retry interval while committed_next is missing (ms)"
+    default 200
+    range 20 5000
+    help
+      If the endpoint has no committed_next (e.g. fresh connect, post-
+      hop, CONFIRM was lost), PROPOSALs are fired at this faster cadence
+      until CONFIRM arrives. The steady-state interval (above) then
+      takes over.
+
+config ZMK_ESB_ENDPOINT_CHANNEL_HOP_REQUEST_BURST_COUNT
+    int "Number of fast-retry PROPOSAL attempts seeded by an inbound REQUEST"
+    default 3
+    range 1 50
+    help
+      When the dongle queues a CHANNEL_HOP_REQUEST (its committed_next
+      is empty and it wants a fresh PROPOSAL), the endpoint seeds this
+      many additional fast-retry attempts at NEGOTIATE_RETRY_MS cadence.
+      A single PROPOSAL is too easy to lose on a weak link; without the
+      burst, the next attempt would be one full NEGOTIATE_INTERVAL_MS
+      away whenever the endpoint's own committed_next happens to be
+      valid (needs_commit=false), so a single dropped PROPOSAL strands
+      the dongle for the steady-state interval. The burst is consumed
+      one attempt per negotiate_work fire and reset to zero on CONFIRM
+      receipt (dongle is back in sync, no more retries needed).
+
+config ZMK_ESB_ENDPOINT_IDLE_THRESHOLD_MS
+    int "Time without user TX before declaring the endpoint idle (ms)"
+    default 150
+    range 50 60000
+    help
+      If no HID / shell-relay packet is sent for this long, the endpoint
+      transitions to an idle state: it sends ESB_PKT_IDLE once (delivered
+      with ESB retries), stops sending CHANNEL_HOP_PROPOSAL, and
+      suppresses its own TX-failure hop trigger so idle heartbeats failing
+      repeatedly cannot drive a hop. The next user packet flips it back
+      to active.
+
+config ZMK_ESB_ENDPOINT_CHANNEL_HOP_POST_BURST_COUNT
+    int "Post-hop PROPOSAL burst count"
+    default 3
+    range 0 50
+    help
+      After a channel hop, the endpoint fires this many PROPOSAL packets
+      on the new channel in quick succession so the dongle's speculative
+      hop has non-IDLE traffic to validate against within the
+      DONGLE_CHANNEL_HOP_VALIDATE_MS window. Until the first CONFIRM
+      arrives the burst picks fresh candidates to rebuild committed_next;
+      after that it re-affirms the agreed channel so a dropped CONFIRM
+      mid-burst cannot leave dongle and endpoint holding different "next"
+      channels. Set to 0 to disable.
+
+config ZMK_ESB_ENDPOINT_CHANNEL_HOP_POST_BURST_INTERVAL_MS
+    int "Post-hop PROPOSAL burst interval (ms between packets)"
+    default 25
+    range 5 1000
+
+config ZMK_ESB_ENDPOINT_CHANNEL_HOP_POST_BURST_RENDEZVOUS_EVERY
+    int "Post-hop burst: send PROPOSAL on rendezvous channel every Nth tick"
+    default 4
+    range 0 50
+    help
+      During the post-hop PROPOSAL burst, every Nth tick is sent on the
+      DTS-default rendezvous channel instead of the new channel, with the
+      proposed field pointing to the keyboard's actual current channel.
+      The dongle's rollback dwell cycle visits the rendezvous channel
+      regularly; catching one of these PROPOSALs lets the dongle commit
+      the right next channel and converge on the keyboard even if it
+      missed the original hop entirely. Set to 0 to disable.
+
+config ZMK_ESB_ENDPOINT_CHANNEL_HOP_RENDEZVOUS_TIMEOUT_MS
+    int "Synchronous rendezvous PROPOSAL TX timeout (ms)"
+    default 25
+    range 1 50
+    help
+      Hard cap on how long the post-hop burst handler will block waiting
+      for the rendezvous-channel PROPOSAL's TX_SUCCESS or TX_FAILED. With
+      retransmit_count=2 and retransmit_delay=470us a worst-case 2-Mbps
+      packet round trip is well under 2 ms; 5 ms allows comfortable
+      headroom without ever stalling the system workqueue.
+
+config ZMK_ESB_ENDPOINT_CHANNEL_HOP_RENDEZVOUS_FALLBACK_MS
+    int "Force a rendezvous-channel hop after this many ms of post-hop TX failure"
+    default 600
+    range 0 10000
+    help
+      If TX continues to fail for this long after a hop committed (i.e.
+      we are inside the cooldown window with no TX_SUCCESS seen since the
+      hop), force a hop to the DTS-default rendezvous channel, bypassing
+      the cooldown gate AND the quarantine list. The rendezvous channel
+      is the dongle's always-included rollback anchor, so worst-case
+      re-acquisition becomes bounded instead of probabilistic.
+
+      MUST be larger than DONGLE_CHANNEL_HOP_RX_SILENCE_MS +
+      DONGLE_CHANNEL_HOP_VALIDATE_MS (defaults 300+200=500) so the
+      endpoint stays on the new channel long enough for the dongle to
+      (a) detect the silence on the old channel, (b) hop to the
+      committed_next, and (c) validate via inbound RX. With a smaller
+      value, the endpoint reverts to default before the dongle ever
+      arrives, so every speculative-hop validation fails and the dongle
+      keeps logging "speculation failed, reverted". Set to 0 to disable.
+
+config ZMK_ESB_ENDPOINT_CHANNEL_HOP_COOLDOWN_MS
+    int "Minimum dwell on the new channel before another hop can fire (ms)"
+    default 700
+    range 0 10000
+    help
+      After a successful channel hop, TX-failure-triggered hops are
+      suppressed for this long. The window must cover the dongle's own
+      silence-watchdog + validate budget (DONGLE_CHANNEL_HOP_RX_SILENCE_MS
+      + DONGLE_CHANNEL_HOP_VALIDATE_MS, defaults ~500 ms) so the dongle
+      has time to arrive on the new channel AND receive at least one
+      PROPOSAL before the endpoint bounces away again. Without the
+      cooldown, 3 consecutive TX fails (~30 ms on a dead link) revert
+      the endpoint long before the dongle's silence watchdog fires, so
+      the speculative hop always validates against an empty channel.
+      The retry path (hop_work EBUSY) is NOT affected — this only
+      suppresses the TX-fail ISR's fresh-hop trigger.
+
+endif # ZMK_ESB_ENDPOINT_CHANNEL_HOP
+
 rsource "shell/Kconfig"
 rsource "behaviors/Kconfig"
+
+config ZMK_ESB_ENDPOINT_BENCH
+    bool "ESB link benchmark (throughput + RSSI)"
+    depends on ZMK_ESB_ENDPOINT && SHELL
+    default n if ZMK_ESB_ENDPOINT && SHELL
+    help
+      Adds 'esb bench' shell command. Run once to start the benchmark;
+      run again after completion to read throughput and RSSI.
+
+config ZMK_ESB_ENDPOINT_BENCH_DURATION_S
+    int "Benchmark duration (seconds)"
+    default 10
+    range 1 60
+    depends on ZMK_ESB_ENDPOINT_BENCH
+
+config ZMK_ESB_ENDPOINT_BENCH_RESULT_POLL_MS
+    int "Benchmark result polling interval (ms)"
+    default 50
+    range 10 500
+    depends on ZMK_ESB_ENDPOINT_BENCH
+
+config ZMK_ESB_ENDPOINT_BENCH_RESULT_TIMEOUT_MS
+    int "Benchmark result wait timeout (ms)"
+    default 1500
+    range 100 10000
+    depends on ZMK_ESB_ENDPOINT_BENCH
 
 endif # ZMK_ESB_ENDPOINT

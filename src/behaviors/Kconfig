@@ -2,3 +2,12 @@ config ZMK_ESB_BEHAVIOR_UNPAIR
     bool "ESB unpair behavior"
     depends on ZMK_ESB_ENDPOINT
     default y
+
+config ZMK_ESB_BEHAVIOR_SHELL_REQ
+    bool "ESB shell-session request behavior"
+    depends on ZMK_ESB_ENDPOINT_SHELL_RELAY
+    default y
+    help
+      Adds a keymap behavior (&esb_shell_req) that asks the dongle to open
+      a shell relay session over USB CDC — equivalent to a short press on
+      the dongle's pair button while paired.

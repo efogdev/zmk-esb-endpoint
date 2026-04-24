@@ -1,0 +1,14 @@
+/*
+ * Copyright (c) 2025 efogdev
+ * SPDX-License-Identifier: MIT
+ */
+
+/ {
+    behaviors {
+        esb_shell_req: esb_shell_req {
+            compatible = "zmk,behavior-esb-shell-req";
+            #binding-cells = <0>;
+            display-name = "Request shell session";
+        };
+    };
+};
