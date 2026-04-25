@@ -11,7 +11,7 @@
 #include <drivers/behavior.h>
 #include "../shell/shell_relay.h"
 
-LOG_MODULE_DECLARE(zmk_esb_shell, CONFIG_ZMK_LOG_LEVEL);
+LOG_MODULE_DECLARE(zmk_esb_shell, CONFIG_ZMK_ESB_ENDPOINT_LOG_LEVEL);
 
 #if DT_HAS_COMPAT_STATUS_OKAY(DT_DRV_COMPAT)
 

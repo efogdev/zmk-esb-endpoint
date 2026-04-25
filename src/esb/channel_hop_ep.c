@@ -10,7 +10,7 @@
 #include "esb_transport.h"
 
 #include <zephyr/logging/log.h>
-LOG_MODULE_REGISTER(zmk_esb_chhop_ep, CONFIG_ZMK_LOG_LEVEL);
+LOG_MODULE_REGISTER(zmk_esb_chhop_ep, CONFIG_ZMK_ESB_ENDPOINT_LOG_LEVEL);
 
 #if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_HOP)
 
@@ -43,6 +43,15 @@ static struct k_work_delayable hop_retry_work;
 static struct k_work           hop_work;
 
 static uint8_t m_post_hop_burst_remaining;
+
+/* Candidate locked in at start_post_hop_burst() so every tick of the
+ * burst proposes the SAME channel until a CONFIRM populates
+ * m_committed_next. Without this, each tick falls through to
+ * pick_candidate() (which is randomised) and the dongle's
+ * commit-on-every-PROPOSAL semantics make committed_next oscillate
+ * across the burst — observed live as 16/93/16 across three ticks.
+ * Reset to INVALID when the burst ends. */
+static uint8_t m_post_hop_burst_candidate = CHANNEL_HOP_INVALID;
 
 /* Counter of PROPOSAL attempts left in the current REQUEST-driven burst.
  * The dongle queues an ESB_PKT_CHANNEL_HOP_REQUEST whenever its
@@ -86,11 +95,59 @@ static uint32_t m_hop_cooldown_until;
  * back on?" gate. 32-bit wrap-safe compare. */
 static volatile uint32_t m_last_link_event_ms;
 
+#if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_RENDEZVOUS)
 /* Set by channel_hop_ep_on_tx_fail_isr when the cooldown-fallback condition
  * triggers; consumed by hop_work_fn to bypass the normal candidate-selection
  * path and target the rendezvous channel directly. Single-bit flag, single
  * producer (ISR), single consumer (workqueue) — no lock. */
 static volatile bool m_rendezvous_fallback_pending;
+#endif
+
+#if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_COOP_HOP)
+/* Cooperative-hop state machine. Fires earlier than the existing TX-fail /
+ * weak-link triggers, in the "moderately degraded" link zone where
+ * retransmits are climbing but most packets still get through. Two-step
+ * handshake:
+ *
+ *   COOP_IDLE   → no handshake in progress.
+ *   COOP_OFFERED → HOP_OFFER queued/in-flight; awaiting TX_SUCCESS to
+ *                  arm the commit timer. Cleared on TX_FAILED.
+ *   COOP_ARMED  → both sides agreed; coop_hop_commit_work scheduled to
+ *                 fire in ~hop_in_ms. Cleared by the commit work itself.
+ *
+ * `m_coop_hop_target` tracks the agreed channel — kept SEPARATE from
+ * m_committed_next so a stale PROPOSAL/CONFIRM round-trip can't poison
+ * the coop-hop target mid-handshake.
+ *
+ * `m_coop_hop_seq` is an 8-bit nonce; HOP_ACCEPT must echo it for the
+ * endpoint to honor a counter-proposal. ESB hardware dedupes
+ * retransmits, but the seq protects the application layer against
+ * out-of-order CONFIRM-vs-OFFER races where a stale PROPOSAL CONFIRM
+ * could otherwise arrive after a fresh OFFER and be mis-attributed.
+ *
+ * `m_last_tx_was_offer` is set by send_offer() right before the radio
+ * transmits and cleared in TX_SUCCESS / TX_FAILED handlers. Lets the
+ * TX_SUCCESS hook decide whether the just-completed TX was the OFFER
+ * (and therefore that the ACK payload contained an ACCEPT).
+ *
+ * `m_coop_hop_cooldown_until` rate-limits coop hops independently of
+ * the existing TX-fail-driven cooldown — a successful coop hop should
+ * not block a subsequent speculative hop and vice versa. */
+enum coop_hop_state {
+    COOP_IDLE = 0,
+    COOP_OFFERED,
+    COOP_ARMED,
+};
+
+static volatile uint8_t m_coop_hop_state;
+static uint8_t  m_coop_hop_target;
+static uint8_t  m_coop_hop_seq;
+static volatile bool m_last_tx_was_offer;
+static uint32_t m_coop_hop_cooldown_until;
+
+static struct k_work_delayable coop_hop_offer_work;
+static struct k_work_delayable coop_hop_commit_work;
+#endif /* COOP_HOP */
 
 /* Delay before re-submitting hop_work after a failed esb_transport_set_channel.
  * -EBUSY resolves within one or two TX slots (retransmit_delay is 470us,
@@ -106,6 +163,9 @@ static bool hop_cooldown_active(void) {
 
 static void enter_idle_state(void);
 static void enter_active_state(bool send_initial_proposal);
+#if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_COOP_HOP)
+static void coop_hop_abort(void);
+#endif
 
 static uint8_t pick_candidate(void) {
     const uint8_t current = esb_transport_get_channel();
@@ -224,6 +284,15 @@ static void enter_idle_state(void) {
     m_active = false;
     k_work_cancel_delayable(&negotiate_work);
     k_work_cancel_delayable(&idle_check_work);
+#if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_COOP_HOP)
+    /* Abort any in-flight cooperative-hop handshake. The link is going
+     * quiet — no urgency to hop, and a half-finished OFFER/ACCEPT
+     * exchange can leave the dongle armed for a hop the endpoint will
+     * never make. The dongle's own disarm rule (see
+     * channel_hop_dongle_note_rx_active) catches the case where it had
+     * already armed; here we just stop the endpoint side. */
+    coop_hop_abort();
+#endif
     LOG_DBG("endpoint entering IDLE");
 
     /* No PROPOSAL on the way out. The original design fired a PROPOSAL
@@ -279,11 +348,24 @@ static void post_hop_burst_work_fn(struct k_work *w) {
     if (m_committed_next != CHANNEL_HOP_INVALID &&
         m_committed_next != current &&
         !quarantine_is(&m_quarantine, m_committed_next)) {
+        /* CONFIRM-derived ground truth — both sides agree on this. */
         candidate = m_committed_next;
+    } else if (m_post_hop_burst_candidate != CHANNEL_HOP_INVALID &&
+               m_post_hop_burst_candidate != current &&
+               !quarantine_is(&m_quarantine, m_post_hop_burst_candidate)) {
+        /* No CONFIRM yet, but burst already picked a candidate — stick
+         * to it. Drives all dongle commits to the same channel until
+         * one CONFIRM gets through, after which the branch above takes
+         * over. Re-validates against quarantine each tick in case a
+         * coop hop quarantined the burst's pick mid-burst. */
+        candidate = m_post_hop_burst_candidate;
     } else {
         candidate = pick_candidate();
+        /* Cache for subsequent ticks of this burst. */
+        m_post_hop_burst_candidate = candidate;
     }
 
+#if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_RENDEZVOUS)
     /* Rendezvous side-trip: every Nth burst tick, send a PROPOSAL on the
      * DTS-default channel pointing the dongle to OUR current channel. The
      * dongle's rollback dwell cycle always includes the default channel,
@@ -317,10 +399,20 @@ static void post_hop_burst_work_fn(struct k_work *w) {
     } else if (candidate != CHANNEL_HOP_INVALID) {
         send_proposal(candidate);
     }
+#else
+    if (candidate != CHANNEL_HOP_INVALID) {
+        send_proposal(candidate);
+    }
+#endif /* RENDEZVOUS */
 
     if (--m_post_hop_burst_remaining > 0) {
         k_work_reschedule(&post_hop_burst_work,
                           K_MSEC(CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_HOP_POST_BURST_INTERVAL_MS));
+    } else {
+        /* Burst done — clear the sticky candidate so the next burst
+         * picks fresh (the link state may have changed since this burst
+         * started). */
+        m_post_hop_burst_candidate = CHANNEL_HOP_INVALID;
     }
 }
 
@@ -329,6 +421,9 @@ static void start_post_hop_burst(void) {
         return;
     }
     m_post_hop_burst_remaining = CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_HOP_POST_BURST_COUNT;
+    /* Fresh burst — clear any leftover sticky candidate from a prior
+     * burst that ended early or was preempted. */
+    m_post_hop_burst_candidate = CHANNEL_HOP_INVALID;
     /* First PROPOSAL lands after the transport's quiet window expires —
      * esb_transport_send silently drops anything sent before then. */
     k_work_reschedule(&post_hop_burst_work,
@@ -370,6 +465,50 @@ static void hop_retry_work_fn(struct k_work *w) {
     k_work_submit(&hop_work);
 }
 
+/* Post-hop bookkeeping shared between the speculative-fail-driven hop
+ * (hop_work_fn) and the cooperative-hop commit work. Called AFTER a
+ * successful esb_transport_set_channel(target). Handles:
+ *   - quarantine of the channel we just left (caller picks duration —
+ *     coop hops use a much shorter hold than fail-driven hops since
+ *     the trigger fires on transient degradation, not a confirmed-bad
+ *     channel)
+ *   - clearing committed_next (the agreed channel was just consumed)
+ *   - arming the cooldown window so TX-fail triggers don't bounce off
+ *     the new channel before the dongle arrives
+ *   - stamping the link-event clock for the rendezvous-fallback timer
+ *   - kicking off the post-hop PROPOSAL burst so the dongle can
+ *     validate against real traffic
+ *   - rescheduling negotiate_work at the fast-retry tempo so a fresh
+ *     committed_next is built quickly
+ *
+ * `prev` is the channel we just left; the caller has already verified
+ * the hop committed (set_channel returned 0). `quarantine_ms` is the
+ * hold time to apply to `prev`.
+ *
+ * The "is_revert" / "is_rendezvous_fallback" branches in hop_work_fn
+ * mutate state BEFORE this is called (they have additional special
+ * cases — clearing quarantine on the target, etc.); this helper only
+ * implements the common tail. Coop hop has no revert / rendezvous
+ * concept, so it calls this directly. */
+static void commit_hop_bookkeeping(uint8_t prev, uint32_t quarantine_ms) {
+    quarantine_add(&m_quarantine, prev, quarantine_ms);
+
+    m_committed_next = CHANNEL_HOP_INVALID;
+
+    m_hop_cooldown_until = k_uptime_get_32() +
+        CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_HOP_COOLDOWN_MS;
+
+    {
+        const uint32_t now = k_uptime_get_32();
+        m_last_link_event_ms = (now == 0) ? 1 : now;
+    }
+
+    start_post_hop_burst();
+
+    k_work_reschedule(&negotiate_work,
+                      K_MSEC(CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_HOP_NEGOTIATE_RETRY_MS));
+}
+
 static void hop_work_fn(struct k_work *w) {
     ARG_UNUSED(w);
     const uint8_t current = esb_transport_get_channel();
@@ -386,10 +525,12 @@ static void hop_work_fn(struct k_work *w) {
      * desync. We also clear quarantine on the rendezvous channel below so
      * subsequent picks may use it freely. */
     bool is_rendezvous_fallback = false;
+#if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_RENDEZVOUS)
     if (m_rendezvous_fallback_pending) {
         m_rendezvous_fallback_pending = false;
         is_rendezvous_fallback = true;
     }
+#endif
 
     /* Decide the target WITHOUT mutating any persistent state. If the
      * radio hop fails, we must leave quarantine, m_prev_channel, and
@@ -455,63 +596,184 @@ static void hop_work_fn(struct k_work *w) {
          * it might be perfectly fine, we just lost sync with the dongle.
          * Clear quarantine on the rendezvous target in case a prior hop
          * had banished it. No revert arming: from here we want the dongle
-         * to find us and resume normal negotiation. */
+         * to find us and resume normal negotiation. Also bypass the
+         * shared bookkeeping's quarantine_add of `current`. */
         m_quarantine.expires_at[target] = 0;
         m_prev_channel = CHANNEL_HOP_INVALID;
         LOG_WRN("rendezvous fallback: %u -> %u (cooldown desync recovery)",
                 current, target);
-    } else {
-        if (is_revert) {
-            /* The prev channel was quarantined by the previous hop; clear that
-             * so we are allowed to occupy it again. */
-            m_quarantine.expires_at[target] = 0;
-            LOG_WRN("no TX success since last hop; reverted %u -> %u", current, target);
+
+        m_committed_next = CHANNEL_HOP_INVALID;
+        m_hop_cooldown_until = k_uptime_get_32() +
+            CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_HOP_COOLDOWN_MS;
+        {
+            const uint32_t now = k_uptime_get_32();
+            m_last_link_event_ms = (now == 0) ? 1 : now;
         }
-        quarantine_add(&m_quarantine, current,
-                       CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_QUARANTINE_MS);
-
-        /* Arm a future revert to `current` only for normal hops. A revert is
-         * one-shot: if this revert also fails, the next hop must go pick a
-         * fresh candidate, not bounce again. */
-        m_prev_channel = is_revert ? CHANNEL_HOP_INVALID : current;
-
-        LOG_INF("channel hop: %u -> %u (quarantined %u for %ums)",
-                current, target, current,
-                (unsigned)CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_QUARANTINE_MS);
+        start_post_hop_burst();
+        k_work_reschedule(&negotiate_work,
+                          K_MSEC(CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_HOP_NEGOTIATE_RETRY_MS));
+        return;
     }
 
-    m_committed_next = CHANNEL_HOP_INVALID;
-
-    /* Arm the post-hop cooldown. During this window, TX-fail-triggered
-     * hops are suppressed so the endpoint stays put long enough for the
-     * dongle to fire its own silence watchdog (RX_SILENCE_MS) and validate
-     * window (VALIDATE_MS). The retry path is not gated by this — a failed
-     * set_channel still retries independently. */
-    m_hop_cooldown_until = k_uptime_get_32() +
-        CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_HOP_COOLDOWN_MS;
-
-    /* Stamp the hop time so the cooldown-fallback path can measure how
-     * long the new channel has been silent. Refreshed on every TX_SUCCESS
-     * so intermittent successes don't permanently suppress the fallback
-     * (they reset the "silence" clock without disarming it). */
-    {
-        const uint32_t now = k_uptime_get_32();
-        m_last_link_event_ms = (now == 0) ? 1 : now;
+    if (is_revert) {
+        /* The prev channel was quarantined by the previous hop; clear that
+         * so we are allowed to occupy it again. */
+        m_quarantine.expires_at[target] = 0;
+        LOG_WRN("no TX success since last hop; reverted %u -> %u", current, target);
     }
 
-    /* Fire a short burst of PROPOSALs so the dongle's speculative hop
-     * validates within its window. */
-    start_post_hop_burst();
+    /* Arm a future revert to `current` only for normal hops. A revert is
+     * one-shot: if this revert also fails, the next hop must go pick a
+     * fresh candidate, not bounce again. */
+    m_prev_channel = is_revert ? CHANNEL_HOP_INVALID : current;
 
-    /* committed_next was just cleared. Schedule negotiate_work at the
-     * fast-retry tempo so we keep hammering on PROPOSAL until CONFIRM
-     * arrives — *not* at the 60s steady-state interval, which would
-     * strand us without a next-hop until long after the burst ended.
-     * negotiate_work_fn will drop back to the slow interval on its own
-     * once committed_next is populated again. */
-    k_work_reschedule(&negotiate_work,
-                      K_MSEC(CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_HOP_NEGOTIATE_RETRY_MS));
+    LOG_INF("channel hop: %u -> %u (quarantined %u for %ums)",
+            current, target, current,
+            (unsigned)CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_QUARANTINE_MS);
+
+    commit_hop_bookkeeping(current,
+                           CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_QUARANTINE_MS);
 }
+
+/* ----- Cooperative-hop handshake ----- */
+
+#if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_COOP_HOP)
+static bool coop_hop_cooldown_active(void) {
+    if (m_coop_hop_cooldown_until == 0) {
+        return false;
+    }
+    return (int32_t)(m_coop_hop_cooldown_until - k_uptime_get_32()) > 0;
+}
+
+static uint8_t coop_hop_pick_target(void) {
+    const uint8_t current = esb_transport_get_channel();
+
+    /* Prefer the pre-negotiated channel if it is still useful — that's
+     * the "may use pre-committed" path the design calls for. Falls back
+     * to a fresh pick otherwise. */
+    if (m_committed_next != CHANNEL_HOP_INVALID &&
+        m_committed_next != current &&
+        !quarantine_is(&m_quarantine, m_committed_next)) {
+        return m_committed_next;
+    }
+    return channel_hop_pick(&m_quarantine,
+                            CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_QUARANTINE_MIN_DISTANCE,
+                            current);
+}
+
+static void coop_hop_offer_work_fn(struct k_work *w) {
+    ARG_UNUSED(w);
+    if (!m_link_up || !m_active) {
+        m_coop_hop_state = COOP_IDLE;
+        return;
+    }
+    if (m_coop_hop_state != COOP_OFFERED) {
+        /* State changed underneath us (e.g. disconnect, idle) before
+         * the workqueue ran. Don't TX a stale OFFER. */
+        return;
+    }
+
+    const uint8_t target = coop_hop_pick_target();
+    if (target == CHANNEL_HOP_INVALID || target == esb_transport_get_channel()) {
+        LOG_WRN("coop hop: no candidate channel; aborting");
+        m_coop_hop_state = COOP_IDLE;
+        return;
+    }
+    m_coop_hop_target = target;
+    m_coop_hop_seq++;
+
+    struct esb_pkt_hop_offer pkt = {
+        .type           = ESB_PKT_HOP_OFFER,
+        .target_channel = target,
+        .hop_in_ms      = (uint8_t)CONFIG_ZMK_ESB_ENDPOINT_COOP_HOP_HOP_IN_MS,
+        .seq            = m_coop_hop_seq,
+    };
+
+    /* Set the offer-in-flight tag immediately before the radio fires.
+     * The TX_SUCCESS handler keys off this to know that the just-
+     * acknowledged ACK payload (if any) was a HOP_ACCEPT and that
+     * arming the commit timer is the right action. */
+    m_last_tx_was_offer = true;
+    const int err = esb_transport_send(ESB_PIPE_DATA, (uint8_t *)&pkt, sizeof(pkt));
+    if (err) {
+        LOG_WRN("coop OFFER send failed: %d", err);
+        m_last_tx_was_offer = false;
+        m_coop_hop_state = COOP_IDLE;
+        return;
+    }
+    LOG_INF("coop hop OFFER: target=%u hop_in=%ums seq=%u",
+            target, pkt.hop_in_ms, m_coop_hop_seq);
+}
+
+static void coop_hop_commit_work_fn(struct k_work *w) {
+    ARG_UNUSED(w);
+    if (m_coop_hop_state != COOP_ARMED) {
+        /* Cancelled (disconnect, idle, abort) between scheduling and
+         * firing. Don't hop. */
+        return;
+    }
+    const uint8_t current = esb_transport_get_channel();
+    const uint8_t target = m_coop_hop_target;
+    if (target == CHANNEL_HOP_INVALID || target == current) {
+        m_coop_hop_state = COOP_IDLE;
+        return;
+    }
+
+    const int err = esb_transport_set_channel(target);
+    if (err) {
+        LOG_ERR("coop hop %u -> %u set_channel failed: %d", current, target, err);
+        m_coop_hop_state = COOP_IDLE;
+        /* Reuse the existing retry path — the TX-fail trigger will
+         * re-fire if the link is genuinely bad. */
+        k_work_reschedule(&hop_retry_work, K_MSEC(HOP_RETRY_DELAY_MS));
+        return;
+    }
+
+    LOG_INF("coop hop committed: %u -> %u (quarantined %u for %ums)",
+            current, target, current,
+            (unsigned)CONFIG_ZMK_ESB_ENDPOINT_COOP_HOP_QUARANTINE_MS);
+    m_prev_channel = CHANNEL_HOP_INVALID;
+    commit_hop_bookkeeping(current,
+                           CONFIG_ZMK_ESB_ENDPOINT_COOP_HOP_QUARANTINE_MS);
+
+    /* Independent cooldown: prevents back-to-back coop hops while the
+     * link settles. The TX-fail-hop cooldown set inside
+     * commit_hop_bookkeeping handles the speculative path; this one
+     * gates the link-degraded ISR's own re-arm. */
+    m_coop_hop_cooldown_until = k_uptime_get_32() +
+        CONFIG_ZMK_ESB_ENDPOINT_COOP_HOP_COOLDOWN_MS;
+    m_coop_hop_state = COOP_IDLE;
+}
+
+static void coop_hop_abort(void) {
+    /* Single point of teardown — used by disconnect, idle entry, and
+     * other state transitions that invalidate an in-flight handshake. */
+    k_work_cancel_delayable(&coop_hop_offer_work);
+    k_work_cancel_delayable(&coop_hop_commit_work);
+    m_coop_hop_state = COOP_IDLE;
+    m_last_tx_was_offer = false;
+}
+
+void channel_hop_ep_on_link_degraded_isr(void) {
+    /* Single producer (RADIO ISR), single consumer (workqueue). The
+     * gates here are racy reads of state vars but the work fn re-checks
+     * before sending — extra fires only cost a workqueue dispatch. */
+    if (!m_link_up || !m_active) {
+        return;
+    }
+    if (m_coop_hop_state != COOP_IDLE) {
+        return;
+    }
+    if (hop_cooldown_active() || coop_hop_cooldown_active()) {
+        return;
+    }
+    /* Latch state before submitting so a second ISR call can't double-
+     * submit the offer work. The actual send happens in the work fn. */
+    m_coop_hop_state = COOP_OFFERED;
+    k_work_reschedule(&coop_hop_offer_work, K_NO_WAIT);
+}
+#endif /* COOP_HOP */
 
 void channel_hop_ep_init(void) {
     quarantine_reset(&m_quarantine);
@@ -521,12 +783,25 @@ void channel_hop_ep_init(void) {
     m_post_hop_burst_remaining = 0;
     m_hop_cooldown_until = 0;
     m_last_link_event_ms = 0;
+#if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_RENDEZVOUS)
     m_rendezvous_fallback_pending = false;
+#endif
     m_request_burst_remaining = 0;
+#if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_COOP_HOP)
+    m_coop_hop_state = COOP_IDLE;
+    m_coop_hop_target = CHANNEL_HOP_INVALID;
+    m_coop_hop_seq = 0;
+    m_last_tx_was_offer = false;
+    m_coop_hop_cooldown_until = 0;
+#endif
     k_work_init_delayable(&negotiate_work, negotiate_work_fn);
     k_work_init_delayable(&idle_check_work, idle_check_work_fn);
     k_work_init_delayable(&post_hop_burst_work, post_hop_burst_work_fn);
     k_work_init_delayable(&hop_retry_work, hop_retry_work_fn);
+#if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_COOP_HOP)
+    k_work_init_delayable(&coop_hop_offer_work, coop_hop_offer_work_fn);
+    k_work_init_delayable(&coop_hop_commit_work, coop_hop_commit_work_fn);
+#endif
     k_work_init(&hop_work, hop_work_fn);
 }
 
@@ -546,12 +821,20 @@ void channel_hop_ep_on_disconnected(void) {
     m_post_hop_burst_remaining = 0;
     m_hop_cooldown_until = 0;
     m_last_link_event_ms = 0;
+#if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_RENDEZVOUS)
     m_rendezvous_fallback_pending = false;
+#endif
     m_request_burst_remaining = 0;
+#if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_COOP_HOP)
+    m_coop_hop_cooldown_until = 0;
+#endif
     k_work_cancel_delayable(&negotiate_work);
     k_work_cancel_delayable(&idle_check_work);
     k_work_cancel_delayable(&post_hop_burst_work);
     k_work_cancel_delayable(&hop_retry_work);
+#if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_COOP_HOP)
+    coop_hop_abort();
+#endif
 }
 
 void channel_hop_ep_note_user_tx(void) {
@@ -562,6 +845,41 @@ void channel_hop_ep_note_user_tx(void) {
 }
 
 void channel_hop_ep_on_rx(const uint8_t *data, uint8_t len) {
+    if (len < 1) {
+        return;
+    }
+
+#if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_COOP_HOP)
+    /* Cooperative-hop ACCEPT path. Updates the agreed target if the
+     * dongle counter-proposed; the actual commit is armed by the
+     * TX_SUCCESS hook on the OFFER (not here) so a stray ACCEPT for an
+     * older OFFER cannot fire a hop. */
+    if (data[0] == ESB_PKT_HOP_ACCEPT) {
+        if (len < sizeof(struct esb_pkt_hop_accept)) {
+            return;
+        }
+        const struct esb_pkt_hop_accept *a = (const void *)data;
+        if (a->seq != m_coop_hop_seq) {
+            LOG_DBG("coop ACCEPT: stale seq %u (have %u), ignoring",
+                    a->seq, m_coop_hop_seq);
+            return;
+        }
+        if (m_coop_hop_state != COOP_OFFERED && m_coop_hop_state != COOP_ARMED) {
+            LOG_DBG("coop ACCEPT for state=%u, ignoring", m_coop_hop_state);
+            return;
+        }
+        if (a->agreed_channel >= CHANNEL_HOP_CHANNEL_COUNT) {
+            return;
+        }
+        if (a->agreed_channel != m_coop_hop_target) {
+            LOG_INF("coop ACCEPT counter-proposed: %u -> %u",
+                    m_coop_hop_target, a->agreed_channel);
+            m_coop_hop_target = a->agreed_channel;
+        }
+        return;
+    }
+#endif /* COOP_HOP */
+
     if (len < sizeof(struct esb_pkt_channel_hop_confirm)) {
         return;
     }
@@ -629,6 +947,30 @@ void channel_hop_ep_on_request(void) {
 }
 
 void channel_hop_ep_on_tx_fail_isr(void) {
+#if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_COOP_HOP)
+    /* If the just-failed packet was a HOP_OFFER, the cooperative-hop
+     * handshake is dead. Tear down state — note this fires from the
+     * RADIO ISR, so we cannot cancel the work item here (k_work_cancel
+     * is workqueue-thread context). The commit work guards on state ==
+     * COOP_ARMED, so clearing state to IDLE is sufficient: any pending
+     * commit_work that fires later will see IDLE and no-op. The dongle
+     * may still be armed (PRX heard OFFER but our PTX missed the ACK);
+     * the dongle's note_rx_active disarm rule handles that case. */
+    if (m_last_tx_was_offer) {
+        m_last_tx_was_offer = false;
+        if (m_coop_hop_state == COOP_OFFERED) {
+            m_coop_hop_state = COOP_IDLE;
+            LOG_DBG("coop OFFER TX_FAILED, aborting handshake");
+            /* Suppress the normal TX-fail trigger for THIS one event:
+             * a single OFFER loss should not double-fire as a
+             * speculative hop. The next TX_FAILED in the streak will
+             * still be counted by the existing window/weak-link
+             * machinery — no permanent suppression. */
+            return;
+        }
+    }
+#endif
+
     /* Only hop while we're actively sending user traffic. During idle
      * the only packets on the wire are the single ESB_PKT_IDLE we fired
      * at transition; if that one fails we do NOT want to hop — nothing
@@ -645,6 +987,7 @@ void channel_hop_ep_on_tx_fail_isr(void) {
      * firing during cooldown regardless — that's precisely what gives the
      * dongle a packet to confirm against. */
     if (hop_cooldown_active()) {
+#if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_RENDEZVOUS)
         /* Cooldown rendezvous fallback: if no positive link event (hop
          * commit or TX_SUCCESS) has occurred for RENDEZVOUS_FALLBACK_MS,
          * the channel is effectively dead. Force a hop to the rendezvous
@@ -663,12 +1006,29 @@ void channel_hop_ep_on_tx_fail_isr(void) {
                 k_work_submit(&hop_work);
             }
         }
+#endif
         return;
     }
     k_work_submit(&hop_work);
 }
 
 void channel_hop_ep_on_tx_success_isr(void) {
+#if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_COOP_HOP)
+    /* If the just-acknowledged packet was a HOP_OFFER, the dongle's
+     * ACCEPT rode in the ACK payload (already consumed by the RX path
+     * which updated m_coop_hop_target if it counter-proposed). Arm the
+     * commit timer for hop_in_ms from now — both sides flip after the
+     * same delay relative to OFFER delivery. */
+    if (m_last_tx_was_offer) {
+        m_last_tx_was_offer = false;
+        if (m_coop_hop_state == COOP_OFFERED) {
+            m_coop_hop_state = COOP_ARMED;
+            k_work_reschedule(&coop_hop_commit_work,
+                              K_MSEC(CONFIG_ZMK_ESB_ENDPOINT_COOP_HOP_HOP_IN_MS));
+        }
+    }
+#endif
+
     /* A packet made it through on the current channel — any pending
      * "revert to the previous channel" arming is no longer appropriate. */
     m_prev_channel = CHANNEL_HOP_INVALID;

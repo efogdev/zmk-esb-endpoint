@@ -15,6 +15,71 @@ config ZMK_ESB_ENDPOINT
 
 if ZMK_ESB_ENDPOINT
 
+config ZMK_ESB_ENDPOINT_LOG_LEVEL
+    int "Log level for the zmk-esb-endpoint module"
+    default 2
+    range 0 4
+    help
+      Compile-time log level for every TU in this module
+      (0=OFF, 1=ERR, 2=WRN, 3=INF, 4=DBG). Independent of
+      CONFIG_ZMK_LOG_LEVEL so a developer keeping ZMK at INFO does
+      not pay the flash cost of every ESB DBG/INF format string.
+      Default 2 (WRN) keeps the field-debuggable warnings/errors and
+      drops ~1.4–1.6 KB of DBG/INF strings.
+
+config ZMK_ESB_ENDPOINT_SHELL_CMDS
+    bool "Register `esb` shell commands (unpair, channel, bench)"
+    depends on SHELL
+    default y
+    help
+      Registers the `esb` root shell command set. Disable on tight
+      ROM budgets — the equivalent functionality is also reachable
+      via the keymap behaviors (`&esb_unpair`) and the optional
+      benchmark/channel-hop diagnostics are not strictly needed
+      in production.
+
+config ZMK_ESB_ENDPOINT_ADAPTIVE_RETRY
+    bool "Adapt ESB retransmit_count from observed link quality"
+    depends on ZMK_ESB_ENDPOINT_CHANNEL_HOP
+    default y
+    help
+      Periodically retunes the ESB retransmit_count based on the EWMA
+      of TX attempts: lower on a clean link (lower tail latency),
+      higher on a degraded one (better survival). Disabling locks
+      retransmit_count at the Kconfig default for the lifetime of the
+      slot. Saves ~150–200 B of flash.
+
+config ZMK_ESB_ENDPOINT_COOP_HOP
+    bool "Cooperative-hop handshake (HOP_OFFER / HOP_ACCEPT)"
+    depends on ZMK_ESB_ENDPOINT_CHANNEL_HOP
+    default y
+    help
+      Adds a synchronised channel-hop path that fires earlier than
+      the dead-link / weak-link triggers, in the moderately-degraded
+      zone where retransmits are climbing but most packets still get
+      through. Both sides flip the radio at a co-ordinated deadline
+      to minimise the blackout window. Disabling falls back to the
+      existing TX-fail-driven and weak-link triggers — coverage
+      remains, but coordinated hops on a degraded-but-not-dead link
+      no longer happen. Saves ~1.0–1.2 KB of flash.
+
+config ZMK_ESB_ENDPOINT_RENDEZVOUS
+    bool "Rendezvous side-trip + cooldown fallback"
+    depends on ZMK_ESB_ENDPOINT_CHANNEL_HOP
+    default y
+    help
+      Two recovery paths that re-acquire a desynced dongle by
+      reaching the DTS-default rendezvous channel:
+      (1) periodic side-trip during the post-hop PROPOSAL burst that
+          briefly hops to the rendezvous channel and tells the
+          dongle where the keyboard actually is, and
+      (2) cooldown fallback that force-hops to the rendezvous
+          channel after RENDEZVOUS_FALLBACK_MS of post-hop silence.
+      Disabling drops `esb_transport_send_blocking`, the
+      synchronous TX state, and both fallback paths — recovery from
+      a missed hop then relies entirely on the dongle's own rollback
+      dwell cycle. Saves ~550 B of flash.
+
 # BT_LL_SW_SPLIT compile-time reserves PPI channels 6-19, leaving only 0-5
 # for application use. ESB needs all 6 of those. Force UART0 to use
 # interrupt-driven TX so it does not claim channel 5 at boot.
@@ -225,7 +290,7 @@ config ZMK_ESB_ENDPOINT_CHANNEL_HOP_WEAK_LINK_MS
       RX-silence watchdog hops alone and validation always fails. Must
       be larger than TX_FAIL_WINDOW_MS so the fast dead-link path still
       wins. Should be smaller than the dongle's
-      DONGLE_CHANNEL_HOP_RX_SILENCE_MS (default 300) so the endpoint
+      DONGLE_CHANNEL_HOP_RX_SILENCE_MS so the endpoint
       hops first and the dongle's silence watchdog can meet it on the
       new channel. Set to 0 to disable.
 
@@ -244,7 +309,7 @@ config ZMK_ESB_ENDPOINT_CHANNEL_HOP_POST_QUIET_MS
 
 config ZMK_ESB_ENDPOINT_CHANNEL_QUARANTINE_MS
     int "Quarantine hold time for a bad channel (ms)"
-    default 30000
+    default 45000
     range 1000 600000
     help
       How long a channel stays in quarantine after a hop. Quarantined
@@ -365,7 +430,7 @@ config ZMK_ESB_ENDPOINT_CHANNEL_HOP_RENDEZVOUS_FALLBACK_MS
       re-acquisition becomes bounded instead of probabilistic.
 
       MUST be larger than DONGLE_CHANNEL_HOP_RX_SILENCE_MS +
-      DONGLE_CHANNEL_HOP_VALIDATE_MS (defaults 300+200=500) so the
+      DONGLE_CHANNEL_HOP_VALIDATE_MS so the
       endpoint stays on the new channel long enough for the dongle to
       (a) detect the silence on the old channel, (b) hop to the
       committed_next, and (c) validate via inbound RX. With a smaller
@@ -381,7 +446,7 @@ config ZMK_ESB_ENDPOINT_CHANNEL_HOP_COOLDOWN_MS
       After a successful channel hop, TX-failure-triggered hops are
       suppressed for this long. The window must cover the dongle's own
       silence-watchdog + validate budget (DONGLE_CHANNEL_HOP_RX_SILENCE_MS
-      + DONGLE_CHANNEL_HOP_VALIDATE_MS, defaults ~500 ms) so the dongle
+      + DONGLE_CHANNEL_HOP_VALIDATE_MS) so the dongle
       has time to arrive on the new channel AND receive at least one
       PROPOSAL before the endpoint bounces away again. Without the
       cooldown, 3 consecutive TX fails (~30 ms on a dead link) revert
@@ -389,6 +454,80 @@ config ZMK_ESB_ENDPOINT_CHANNEL_HOP_COOLDOWN_MS
       the speculative hop always validates against an empty channel.
       The retry path (hop_work EBUSY) is NOT affected — this only
       suppresses the TX-fail ISR's fresh-hop trigger.
+
+config ZMK_ESB_ENDPOINT_LINK_QUALITY_WINDOW
+    int "Link-quality sliding window size (ACKed packets)"
+    default 32
+    range 8 32
+    help
+      Number of recent ACKed TX events held in the link-quality shift
+      register. Each bit is 1 if event->tx_attempts > 1 (i.e. at least
+      one ESB retransmit was needed). Used by the cooperative-hop
+      trigger and exposed for shell observability.
+
+config ZMK_ESB_ENDPOINT_LINK_DEGRADED_THRESHOLD
+    int "Cooperative-hop trigger: retried packets in window"
+    default 5
+    range 1 32
+    help
+      The cooperative-hop handshake fires when at least this many of the
+      LINK_QUALITY_WINDOW most recent ACKed packets needed an ESB
+      retransmit.
+
+config ZMK_ESB_ENDPOINT_LINK_DEGRADED_REARM
+    int "Cooperative-hop trigger: re-arm threshold"
+    default 2
+    range 0 32
+    help
+      After a cooperative-hop trigger fires, suppress further triggers
+      until the popcount drops back to this value (or COOP_HOP_COOLDOWN_MS
+      elapses). Provides hysteresis so a single noisy window doesn't
+      keep retriggering.
+
+config ZMK_ESB_ENDPOINT_LINK_DEGRADED_FAST_THRESHOLD
+    int "Cooperative-hop trigger: retried packets in last 8"
+    default 3
+    range 0 8
+    help
+      Fast-path trigger: also fire if at least this many of the most
+      recent 8 ACKed packets needed retransmission. Catches sudden
+      cliffs before the wide LINK_QUALITY_WINDOW catches up. Set to 9
+      to disable.
+
+config ZMK_ESB_ENDPOINT_COOP_HOP_HOP_IN_MS
+    int "Cooperative hop: delay between OFFER delivery and channel switch (ms)"
+    default 5
+    range 2 50
+    help
+      How long after the HOP_OFFER is delivered both sides wait before
+      flipping the radio. Must exceed the worst-case workqueue
+      scheduling jitter on either side (~1 ms) plus enough margin for
+      the dongle's stop_rx → set_channel → start_rx sequence
+      (CONFIG_DONGLE_COOP_HOP_PRX_SETUP_BUDGET_MS). 8 ms is a
+      comfortable default; lower values reduce blackout but risk skew.
+
+config ZMK_ESB_ENDPOINT_COOP_HOP_COOLDOWN_MS
+    int "Cooperative hop: minimum interval between two coop hops (ms)"
+    default 1500
+    range 100 30000
+    help
+      After a cooperative hop commits, suppress the next coop trigger
+      for this long. Independent of the TX-fail cooldown
+      (CHANNEL_HOP_COOLDOWN_MS) so that an existing speculative hop is
+      not blocked by a prior coop hop and vice versa. Should comfortably
+      exceed the link-quality window's settling time.
+
+config ZMK_ESB_ENDPOINT_COOP_HOP_QUARANTINE_MS
+    int "Cooperative hop: quarantine hold for the channel just left (ms)"
+    default 10000
+    range 100 600000
+    help
+      Coop hops fire on a moderately degraded link, where interference
+      is often transient (someone walked in front of the antenna, a
+      neighbouring radio burst). Quarantining for the full
+      CHANNEL_QUARANTINE_MS would lock out a perfectly good channel
+      after one bad few hundred milliseconds. This shorter hold gives
+      the channel a chance to come back into the candidate pool quickly.
 
 endif # ZMK_ESB_ENDPOINT_CHANNEL_HOP
 

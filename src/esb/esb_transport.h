@@ -68,5 +68,42 @@ void esb_transport_reset_consecutive_fail(void);
  * recently. */
 uint32_t esb_transport_ms_since_activity(void);
 
+/* Snapshot of the link-quality metric used by the cooperative-hop trigger.
+ * `*retried_out` (if non-NULL) gets the popcount of the last
+ * LINK_QUALITY_WINDOW ACKed packets that needed at least one ESB
+ * retransmit. `*ewma_x10_out` (if non-NULL) gets the EWMA of tx_attempts
+ * times 10 (so 10 == 1.0 attempts == perfect link, 25 == 2.5 attempts).
+ * Returns 0 always; the args are independent so a caller can request
+ * just one. Reads are non-locking single-word loads; values may shift
+ * between fields but are individually consistent.
+ *
+ * No-op (writes 0) if CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_HOP is disabled. */
+int esb_transport_get_link_quality(uint8_t *retried_out, uint16_t *ewma_x10_out);
+
+/* True when the transport is in a state that would silently drop user
+ * sends (post-hop quiet window, synchronous side-trip in flight). Allows
+ * callers that accumulate state (e.g. the mouse input processor's pending
+ * dx/dy) to skip emitting a report whose payload would be thrown away,
+ * preserving the accumulated delta for the next emission. */
+bool esb_transport_is_quiet(void);
+
+/* Handle an inbound ESB_PKT_LINK_STATS payload. Called from pairing.c's
+ * RX dispatch. Silently drops too-short frames. */
+void esb_transport_on_rx_link_stats(const uint8_t *data, uint8_t len);
+
+/* Latest peer-reported RSSI snapshot. Returns false if no LINK_STATS has
+ * been received since the last connect or channel hop (outputs untouched).
+ * last_out / ewma_out may be NULL. */
+bool esb_transport_get_peer_rssi(int8_t *last_out, int8_t *ewma_out);
+
+/* Cumulative lifetime PER counters. Any output pointer may be NULL.
+ *  ok_out        — ACKed TX events (includes events that needed retries)
+ *  retried_out   — subset of ok where tx_attempts > 1 (at least one retry)
+ *  exhausted_out — TX events that exhausted retransmit_count and failed
+ * Sync-TX (rendezvous side-trip) events are excluded from all three.
+ * PER over any interval ≈ delta(exhausted) / (delta(ok) + delta(exhausted)). */
+void esb_transport_get_per_stats(uint32_t *ok_out, uint32_t *retried_out,
+                                 uint32_t *exhausted_out);
+
 void esb_transport_on_slot_start(void);
 void esb_transport_on_slot_stop(void);

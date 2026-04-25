@@ -27,7 +27,7 @@
 #endif
 
 #include <zephyr/logging/log.h>
-LOG_MODULE_REGISTER(zmk_esb_transport, CONFIG_ZMK_LOG_LEVEL);
+LOG_MODULE_REGISTER(zmk_esb_transport, CONFIG_ZMK_ESB_ENDPOINT_LOG_LEVEL);
 
 /* nRF52833: RADIO_IRQn = 1 */
 #define RADIO_IRQn 1
@@ -84,6 +84,7 @@ static struct {
     bool configured;
 } m_addr;
 
+#if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_RENDEZVOUS)
 /* Synchronous TX state. Used by esb_transport_send_blocking() to fire one
  * packet on a transient channel and wait for the radio's TX_SUCCESS /
  * TX_FAILED before returning. While in_progress is true:
@@ -97,6 +98,7 @@ static struct {
 static struct k_sem    m_sync_tx_done;
 static volatile bool   m_sync_tx_in_progress;
 static volatile bool   m_sync_tx_result_success;
+#endif
 
 static struct k_work rx_work;
 static uint8_t rx_buf[ESB_MAX_PAYLOAD_LEN];
@@ -104,9 +106,32 @@ static uint8_t rx_len;
 
 static uint32_t tx_ok_count;
 static uint32_t tx_fail_count;
+static uint32_t tx_retried_count;      /* ACKed events with tx_attempts > 1 */
+static uint32_t tx_exhausted_count;    /* packets that died after all retries */
 static uint32_t consecutive_tx_fail;
 
 #if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_HOP)
+#if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_ADAPTIVE_RETRY)
+/* Adaptive retransmit count state. Recomputed periodically from
+ * m_link_quality_ewma_x10 so the radio spends fewer retries on a clean
+ * link (lower tail latency) and more on a degraded one (survival over
+ * speed). Last applied value cached to elide redundant set_retransmit_count
+ * calls. Initialised at esb_transport_init to the Kconfig default, which
+ * is also what esb_init_and_configure programs on slot start. */
+static uint8_t m_adaptive_retransmit_count =
+    CONFIG_ZMK_ESB_ENDPOINT_RETRANSMIT_COUNT;
+static struct k_work_delayable m_adaptive_retry_work;
+
+#define ADAPTIVE_RETRY_INTERVAL_MS 100u
+/* EWMA breakpoints (attempts × 10). Below LOW we're near the perfect
+ * link (mostly 1-attempt packets) — drop to MIN. Above HIGH we're
+ * retrying often — push to MAX. Linear between, rounded toward MIN. */
+#define ADAPTIVE_RETRY_EWMA_LOW    15u   /* 1.5 avg attempts */
+#define ADAPTIVE_RETRY_EWMA_HIGH   30u   /* 3.0 avg attempts */
+#define ADAPTIVE_RETRY_COUNT_MIN   4u
+#define ADAPTIVE_RETRY_COUNT_MAX   12u
+#endif /* ADAPTIVE_RETRY */
+
 /* Time-window TX-failure tracking. m_first_fail_ms holds the uptime at
  * which the current fail window started; cleared on any TX_SUCCESS and
  * on channel change. We deliberately do NOT use a "triggered-once" latch:
@@ -136,6 +161,46 @@ static uint32_t m_last_tx_success_ms;
  * new traffic that would otherwise count as failures. Zero means "no
  * active quiet period". 32-bit wrap-safe compare in the send path. */
 static uint32_t m_tx_quiet_until_ms;
+
+/* Link-quality observability. The nRF ESB library reports tx_attempts on
+ * every TX event (1 = first try succeeded, N+1 on a failure where N is
+ * retransmit_count). m_link_quality_window is a sliding shift register —
+ * one bit per ACKed TX event, set when the event needed at least one
+ * retransmit. m_link_quality_count caches its popcount so the
+ * threshold check is O(1) per packet. The metric is independent of the
+ * TX-fail-window and weak-link triggers; it lights up much earlier (at
+ * 5–10% PER) so a cooperative hop can fire while the link is still
+ * carrying traffic. Reset by esb_transport_set_channel() — a hop wipes
+ * link history.
+ *
+ * m_link_quality_ewma_x10 is the EWMA of tx_attempts itself (×10 for
+ * fixed-point), exposed via esb_transport_get_link_quality() purely
+ * for shell/observability. Updated at the same time as the popcount.
+ *
+ * m_recent_noack[] tracks the noack flag of the last 8 sends in arrival
+ * order, indexed by m_recent_noack_head (low 3 bits). Each TX event
+ * consumes the tail entry and skips the metric update if the matching
+ * send was noack — those report tx_attempts=1 unconditionally and
+ * would dilute the signal toward zero. The send-side push runs on the
+ * same TX path that yields the event, so head/tail stay in sync as
+ * long as we account for one push per event. */
+#define LQ_NOACK_RING_SIZE 8
+static uint32_t m_link_quality_window;
+static uint8_t  m_link_quality_count;
+static uint16_t m_link_quality_ewma_x10;
+static uint8_t  m_recent_noack[LQ_NOACK_RING_SIZE];
+static uint8_t  m_recent_noack_head;
+static uint8_t  m_recent_noack_tail;
+
+#if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_COOP_HOP)
+/* Hysteresis gate. Set when a link-degraded trigger fires; cleared when
+ * popcount drops to LINK_DEGRADED_REARM. While set, threshold-cross
+ * checks are skipped so a single noisy window does not retrigger
+ * before the link has had a chance to settle (or the cooperative-hop
+ * cooldown expires elsewhere). Single-byte read/write from RADIO ISR
+ * and from set_channel — race is benign. */
+static volatile bool m_link_degraded_armed;
+#endif /* COOP_HOP */
 #endif
 
 /* 32-bit wrap-safe: (uint32_t)(now - last) stays correct for spans up to
@@ -143,6 +208,55 @@ static uint32_t m_tx_quiet_until_ms;
  * on Cortex-M is atomic, so no lock is needed. */
 static uint32_t m_last_activity_ms;
 static bool     m_activity_seen;
+
+/* xorshift32 state for retry-delay jitter. Seeded lazily on first use from
+ * k_uptime_get_32 — we cannot rely on init ordering w.r.t. the kernel
+ * clock. One static counter flipped monotonically so the seed re-derives
+ * if m_jitter_rng happens to land on 0. No thread-safety: caller is
+ * esb_transport_send, which runs on the user thread and is not re-entered
+ * (the send path is serialised by the ESB library's own locks). */
+static uint32_t m_jitter_rng;
+
+static uint16_t jittered_retransmit_delay(void) {
+    if (m_jitter_rng == 0) {
+        uint32_t seed = k_uptime_get_32();
+        seed ^= (uint32_t)(uintptr_t)&m_jitter_rng;
+        if (seed == 0) {
+            seed = 0xA3C59B1Du;
+        }
+        m_jitter_rng = seed;
+    }
+    /* xorshift32 — one multiplication-free step, plenty random for jitter. */
+    m_jitter_rng ^= m_jitter_rng << 13;
+    m_jitter_rng ^= m_jitter_rng >> 17;
+    m_jitter_rng ^= m_jitter_rng << 5;
+
+    /* ±12.5% of base, computed as base ± (base >> 3) * (random_byte / 128).
+     * Using a byte-wide mixer keeps the arithmetic tight; 12.5% is
+     * enough to de-correlate from periodic interferers (WiFi beacons at
+     * 102.4 ms, BLE adv at 20/30/50 ms) without extending the retry
+     * slot enough to overrun the Nordic ESB library's internal timing. */
+    const uint32_t base = CONFIG_ZMK_ESB_ENDPOINT_RETRANSMIT_DELAY_US;
+    const uint32_t span = base >> 3;  /* 12.5% */
+    const int8_t   off  = (int8_t)(m_jitter_rng & 0xFFu);  /* -128..127 */
+    const int32_t  delta = ((int32_t)span * off) / 128;
+    int32_t d = (int32_t)base + delta;
+    if (d < 100) {
+        d = 100;  /* hard floor — Nordic ESB rejects values below ~50 µs */
+    }
+    if (d > UINT16_MAX) {
+        d = UINT16_MAX;
+    }
+    return (uint16_t)d;
+}
+
+/* Peer's (dongle's) view of the link. Stamped from ESB_PKT_LINK_STATS ACK
+ * payloads; consumed by adaptive-retransmit and future TX-power logic.
+ * m_peer_rssi_valid flips true on the first LINK_STATS RX — before that
+ * the values are meaningless. Single-byte loads on Cortex-M, no lock. */
+static int8_t  m_peer_rssi_last;
+static int8_t  m_peer_rssi_ewma;
+static bool    m_peer_rssi_valid;
 
 static void note_activity(void) {
     m_last_activity_ms = k_uptime_get_32();
@@ -174,9 +288,100 @@ static void rx_work_fn(struct k_work *w) {
     m_cb(&evt);
 }
 
+#if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_HOP)
+/* Pop one entry from the noack ring (in arrival order). Returns true if
+ * the matching send was noack — the caller should skip the metric
+ * update in that case. If the ring is empty (event arrived without a
+ * matching push, e.g. on first-event-after-reset), returns false so
+ * the event is counted; mis-attribution here is bounded by ring size. */
+static bool consume_recent_noack(void) {
+    if (m_recent_noack_tail == m_recent_noack_head) {
+        return false;
+    }
+    const bool was_noack =
+        m_recent_noack[m_recent_noack_tail & (LQ_NOACK_RING_SIZE - 1)] != 0;
+    m_recent_noack_tail++;
+    return was_noack;
+}
+
+/* Shift one bit into the link-quality window, maintain the cached
+ * popcount, update the EWMA. Called from the RADIO ISR. Single-word
+ * Cortex-M reads/writes on the state vars are atomic; the shell
+ * accessor takes a snapshot rather than locking. */
+static void link_quality_record(uint8_t tx_attempts, bool retry_bit) {
+    const uint32_t old_window = m_link_quality_window;
+    const uint32_t mask = (CONFIG_ZMK_ESB_ENDPOINT_LINK_QUALITY_WINDOW < 32)
+        ? ((1u << CONFIG_ZMK_ESB_ENDPOINT_LINK_QUALITY_WINDOW) - 1u)
+        : 0xFFFFFFFFu;
+    const bool dropped_bit = (CONFIG_ZMK_ESB_ENDPOINT_LINK_QUALITY_WINDOW < 32)
+        ? ((old_window >> (CONFIG_ZMK_ESB_ENDPOINT_LINK_QUALITY_WINDOW - 1)) & 1u)
+        : ((old_window >> 31) & 1u);
+    const uint32_t new_window = ((old_window << 1) | (retry_bit ? 1u : 0u)) & mask;
+    m_link_quality_window = new_window;
+
+    /* Popcount delta: subtract the bit shifted out (only meaningful
+     * once the window has filled — but the bit there is initialized to
+     * 0 anyway, so the delta is correct from boot). */
+    if (retry_bit && !dropped_bit) {
+        m_link_quality_count++;
+    } else if (!retry_bit && dropped_bit) {
+        m_link_quality_count--;
+    }
+
+    /* EWMA × 10 of attempts: ewma' = (ewma * 7 + attempts*10) / 8.
+     * Saturating to retransmit_count+1 in case of noise. Initialized
+     * to 10 (== 1.0 attempts) in init / set_channel. */
+    const uint16_t a10 = (uint16_t)tx_attempts * 10u;
+    m_link_quality_ewma_x10 =
+        (uint16_t)(((uint32_t)m_link_quality_ewma_x10 * 7u + a10) / 8u);
+}
+
+#if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_COOP_HOP)
+/* Weak default so the symbol resolves when channel-hop or coop-hop is
+ * compiled out. The real implementation lives in channel_hop_ep.c. */
+__weak void channel_hop_ep_on_link_degraded_isr(void) {}
+#endif
+
+#if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_ADAPTIVE_RETRY)
+/* Map the current link-quality EWMA to a target retransmit count.
+ * EWMA is attempts × 10; higher means more retries are happening so
+ * we raise the ceiling. Linear interpolation between the two
+ * breakpoints; saturates at MIN / MAX outside. */
+static uint8_t adaptive_retry_target(void) {
+    const uint16_t ewma = m_link_quality_ewma_x10;
+    if (ewma <= ADAPTIVE_RETRY_EWMA_LOW) {
+        return ADAPTIVE_RETRY_COUNT_MIN;
+    }
+    if (ewma >= ADAPTIVE_RETRY_EWMA_HIGH) {
+        return ADAPTIVE_RETRY_COUNT_MAX;
+    }
+    const uint32_t span = ADAPTIVE_RETRY_EWMA_HIGH - ADAPTIVE_RETRY_EWMA_LOW;
+    const uint32_t into = ewma - ADAPTIVE_RETRY_EWMA_LOW;
+    const uint32_t delta =
+        (into * (ADAPTIVE_RETRY_COUNT_MAX - ADAPTIVE_RETRY_COUNT_MIN)) / span;
+    return (uint8_t)(ADAPTIVE_RETRY_COUNT_MIN + delta);
+}
+
+static void adaptive_retry_work_fn(struct k_work *work) {
+    ARG_UNUSED(work);
+    const uint8_t want = adaptive_retry_target();
+    if (want != m_adaptive_retransmit_count) {
+        if (esb_set_retransmit_count(want) == 0) {
+            m_adaptive_retransmit_count = want;
+            LOG_DBG("adaptive retry: ewma_x10=%u -> count=%u",
+                    m_link_quality_ewma_x10, want);
+        }
+    }
+    k_work_reschedule(&m_adaptive_retry_work,
+                      K_MSEC(ADAPTIVE_RETRY_INTERVAL_MS));
+}
+#endif /* ADAPTIVE_RETRY */
+#endif
+
 static void zmk_esb_transport_evt_cb(struct esb_evt const *event) {
     switch (event->evt_id) {
     case ESB_EVENT_TX_SUCCESS:
+#if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_RENDEZVOUS)
         if (m_sync_tx_in_progress) {
             /* This event belongs to esb_transport_send_blocking() — it
              * sent on a different channel and the regular bookkeeping
@@ -189,7 +394,11 @@ static void zmk_esb_transport_evt_cb(struct esb_evt const *event) {
             k_sem_give(&m_sync_tx_done);
             break;
         }
+#endif
         tx_ok_count++;
+        if (event->tx_attempts > 1) {
+            tx_retried_count++;
+        }
         consecutive_tx_fail = 0;
 #if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_HOP)
         m_first_fail_ms = 0;
@@ -198,6 +407,48 @@ static void zmk_esb_transport_evt_cb(struct esb_evt const *event) {
             m_last_tx_success_ms = (now_ok == 0) ? 1 : now_ok;
         }
         channel_hop_ep_on_tx_success_isr();
+        /* Link-quality metric. Skip the slot if the matching send was
+         * noack — those events report tx_attempts=1 unconditionally
+         * and would dilute the signal. The hop_*-cooldown tracking is
+         * separate, so this metric stays live across hops; the
+         * window itself is reset by set_channel so a hop wipes
+         * stale history. */
+        {
+            const bool was_noack = consume_recent_noack();
+            if (!was_noack) {
+                const bool retry = (event->tx_attempts > 1);
+                link_quality_record((uint8_t)event->tx_attempts, retry);
+
+#if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_COOP_HOP)
+                /* Threshold check + hysteresis re-arm. Wide window
+                 * fires the trigger; fast-path fires on a sudden
+                 * cliff in the last 8 events. */
+                if (m_link_degraded_armed) {
+                    if (m_link_quality_count <=
+                        CONFIG_ZMK_ESB_ENDPOINT_LINK_DEGRADED_REARM) {
+                        m_link_degraded_armed = false;
+                    }
+                } else {
+                    bool fire = false;
+                    if (m_link_quality_count >=
+                        CONFIG_ZMK_ESB_ENDPOINT_LINK_DEGRADED_THRESHOLD) {
+                        fire = true;
+                    } else {
+                        const uint8_t fast = (uint8_t)__builtin_popcount(
+                            m_link_quality_window & 0xFFu);
+                        if (fast >=
+                            CONFIG_ZMK_ESB_ENDPOINT_LINK_DEGRADED_FAST_THRESHOLD) {
+                            fire = true;
+                        }
+                    }
+                    if (fire) {
+                        m_link_degraded_armed = true;
+                        channel_hop_ep_on_link_degraded_isr();
+                    }
+                }
+#endif /* COOP_HOP */
+            }
+        }
 #endif
 #if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_SHELL_RELAY)
         esb_shell_relay_notify_tx();
@@ -208,6 +459,7 @@ static void zmk_esb_transport_evt_cb(struct esb_evt const *event) {
         break;
 
     case ESB_EVENT_TX_FAILED:
+#if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_RENDEZVOUS)
         if (m_sync_tx_in_progress) {
             /* See TX_SUCCESS branch — this fail belongs to the side-trip,
              * not the active channel. Skip all hop / counter machinery so
@@ -219,7 +471,9 @@ static void zmk_esb_transport_evt_cb(struct esb_evt const *event) {
             esb_flush_tx();
             break;
         }
+#endif
         tx_fail_count++;
+        tx_exhausted_count++;
         consecutive_tx_fail++;
         if (consecutive_tx_fail == CONSECUTIVE_WARN_THRESHOLD) {
             LOG_WRN("%u consecutive TX failures (ok=%u)", consecutive_tx_fail, tx_ok_count);
@@ -289,6 +543,20 @@ static void zmk_esb_transport_evt_cb(struct esb_evt const *event) {
             }
         }
 #endif
+        /* TX_FAILED also feeds the link-quality metric: definite retry
+         * exhaustion is a stronger "1" than a single retransmit. We
+         * still consume the noack slot to keep ring head/tail in sync,
+         * but unconditionally count it as retried — the existing
+         * TX-fail trigger is the real escalation path here, the
+         * metric just keeps coop-hop's view of "how bad is it" honest. */
+        {
+            (void)consume_recent_noack();
+            link_quality_record((uint8_t)event->tx_attempts, true);
+            /* Don't fire the coop-hop trigger from the fail branch:
+             * TX-fail-window / weak-link triggers already own the
+             * "really bad" path, and double-firing would race a
+             * speculative hop against a coop hop. */
+        }
 #endif
 #if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_BENCH)
         esb_bench_notify_tx_fail();
@@ -318,7 +586,13 @@ static int esb_init_and_configure(void) {
     cfg.retransmit_count   = CONFIG_ZMK_ESB_ENDPOINT_RETRANSMIT_COUNT;
     cfg.retransmit_delay   = CONFIG_ZMK_ESB_ENDPOINT_RETRANSMIT_DELAY_US;
     cfg.tx_mode            = ESB_TXMODE_AUTO;
-    cfg.use_fast_ramp_up   = false;
+    /* nRF52833 fast ramp-up shortens radio RXIDLE→RX from ~140 µs to ~40 µs
+     * (RADIO->MODECNF0.RU=1). Both endpoint and dongle must match — see
+     * dongle/src/esb_prx.c cfg.use_fast_ramp_up. Shortens each retry's
+     * airtime budget, letting the retransmit_delay cover more back-to-back
+     * attempts and reducing the probability a retry window lands on a
+     * periodic interferer. */
+    cfg.use_fast_ramp_up   = true;
     cfg.tx_output_power    = ESB_TX_POWER_8DBM;
     cfg.selective_auto_ack = IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_HID_NOACK);
     cfg.event_handler      = zmk_esb_transport_evt_cb;
@@ -361,8 +635,18 @@ static void install_ram_vtor(void) {
 int esb_transport_init(const esb_transport_cb_t cb) {
     m_cb = cb;
     k_work_init(&rx_work, rx_work_fn);
+#if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_RENDEZVOUS)
     k_sem_init(&m_sync_tx_done, 0, 1);
+#endif
     install_ram_vtor();
+#if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_HOP)
+    /* Seed the EWMA at "perfect link" (1.0 attempts × 10) so the shell
+     * snapshot reports a sensible value before any TX has happened. */
+    m_link_quality_ewma_x10 = 10;
+#if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_ADAPTIVE_RETRY)
+    k_work_init_delayable(&m_adaptive_retry_work, adaptive_retry_work_fn);
+#endif
+#endif
     return 0;
 }
 
@@ -406,12 +690,29 @@ int esb_transport_set_channel(const uint8_t channel) {
     }
     m_addr.channel = channel;
     consecutive_tx_fail = 0;
+    /* Peer's RSSI view is per-link, not per-channel — the dongle samples
+     * over its own radio which now has to re-establish contact. Invalidate
+     * so consumers don't act on stale values during the quiet window. */
+    m_peer_rssi_valid = false;
 #if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_HOP)
     m_first_fail_ms = 0;
     /* New channel — no evidence yet that anything is alive here. The
      * weak-link trigger's != 0 gate keeps it quiet until a real
      * TX_SUCCESS re-arms the clock. */
     m_last_tx_success_ms = 0;
+    /* Wipe link-quality history: the new channel deserves a fresh
+     * scoreboard, and bits carried over from a degraded old channel
+     * would re-trigger coop hop instantly. EWMA reset to 1.0×10. */
+    m_link_quality_window = 0;
+    m_link_quality_count = 0;
+    m_link_quality_ewma_x10 = 10;
+#if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_COOP_HOP)
+    m_link_degraded_armed = false;
+#endif
+    /* Drain the noack ring too — any in-flight pre-hop sends produced
+     * push entries we'll never see TX events for (esb_flush_tx above).
+     * Restarting tail at head keeps consume_recent_noack happy. */
+    m_recent_noack_tail = m_recent_noack_head;
     /* Arm the post-hop quiet window. Any send() during this interval is
      * silently dropped — the dongle may still be on the old channel and
      * anything we transmit would just fail and feed the next hop trigger.
@@ -428,6 +729,78 @@ void esb_transport_reset_consecutive_fail(void) {
     consecutive_tx_fail = 0;
 }
 
+void esb_transport_on_rx_link_stats(const uint8_t *data, const uint8_t len) {
+    if (len < sizeof(struct esb_pkt_link_stats)) {
+        return;
+    }
+    const struct esb_pkt_link_stats *s = (const void *)data;
+    m_peer_rssi_last = s->rssi_last;
+    m_peer_rssi_ewma = s->rssi_ewma;
+    m_peer_rssi_valid = true;
+}
+
+bool esb_transport_get_peer_rssi(int8_t *last_out, int8_t *ewma_out) {
+    if (!m_peer_rssi_valid) {
+        return false;
+    }
+    if (last_out) {
+        *last_out = m_peer_rssi_last;
+    }
+    if (ewma_out) {
+        *ewma_out = m_peer_rssi_ewma;
+    }
+    return true;
+}
+
+bool esb_transport_is_quiet(void) {
+#if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_RENDEZVOUS)
+    if (m_sync_tx_in_progress) {
+        return true;
+    }
+#endif
+#if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_HOP)
+    if (m_tx_quiet_until_ms != 0) {
+        const uint32_t now = k_uptime_get_32();
+        if ((int32_t)(m_tx_quiet_until_ms - now) > 0) {
+            return true;
+        }
+    }
+#endif
+    return false;
+}
+
+void esb_transport_get_per_stats(uint32_t *ok_out, uint32_t *retried_out,
+                                 uint32_t *exhausted_out) {
+    if (ok_out) {
+        *ok_out = tx_ok_count;
+    }
+    if (retried_out) {
+        *retried_out = tx_retried_count;
+    }
+    if (exhausted_out) {
+        *exhausted_out = tx_exhausted_count;
+    }
+}
+
+int esb_transport_get_link_quality(uint8_t *retried_out, uint16_t *ewma_x10_out) {
+#if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_HOP)
+    if (retried_out) {
+        *retried_out = m_link_quality_count;
+    }
+    if (ewma_x10_out) {
+        *ewma_x10_out = m_link_quality_ewma_x10;
+    }
+#else
+    if (retried_out) {
+        *retried_out = 0;
+    }
+    if (ewma_x10_out) {
+        *ewma_x10_out = 10;
+    }
+#endif
+    return 0;
+}
+
 void esb_transport_deinit(void) {
     m_addr.configured = false;
 }
@@ -437,6 +810,7 @@ int esb_transport_send(const uint8_t pipe, const uint8_t *data, uint8_t len) {
         return -EMSGSIZE;
     }
 
+#if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_RENDEZVOUS)
     /* Drop any user-thread send while a synchronous side-trip is on the
      * radio. The rendezvous send temporarily flips RADIO->FREQUENCY to
      * another channel; queueing a user packet here would let the ESB
@@ -445,6 +819,15 @@ int esb_transport_send(const uint8_t pipe, const uint8_t *data, uint8_t len) {
     if (m_sync_tx_in_progress) {
         return 0;
     }
+#endif
+
+    /* Jitter the retransmit delay per-send. De-correlates retries from
+     * periodic 2.4 GHz interferers (WiFi beacons, BLE adv) that might
+     * happen to line up with the fixed base delay. Cheap — one xorshift
+     * step + one register write. esb_set_retransmit_delay stores the
+     * value for the radio state machine to pick up on the next TX;
+     * safe from thread context. */
+    (void)esb_set_retransmit_delay(jittered_retransmit_delay());
 
 #if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_HOP)
     /* Post-hop quiet window: the dongle needs a moment to follow us to
@@ -486,6 +869,19 @@ int esb_transport_send(const uint8_t pipe, const uint8_t *data, uint8_t len) {
         esb_flush_tx();
     }
 
+#if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_HOP)
+    /* Stamp the noack flag of this send into the link-quality ring so
+     * the matching TX event handler can decide whether to count it.
+     * The flush above can drop unsent packets; we accept that as one
+     * skipped-but-recorded ring slot (the next event still consumes
+     * the next tail entry, which now corresponds to the post-flush
+     * send — at worst we mis-attribute one packet's noack-ness, which
+     * the wide window absorbs). */
+    m_recent_noack[m_recent_noack_head & (LQ_NOACK_RING_SIZE - 1)] =
+        noack ? 1U : 0U;
+    m_recent_noack_head++;
+#endif
+
     const bool is_bg_poll = (len >= 1) && (data[0] == ESB_PKT_SHELL_BG_POLL);
     if (!is_bg_poll) {
         note_activity();
@@ -513,6 +909,7 @@ int esb_transport_send(const uint8_t pipe, const uint8_t *data, uint8_t len) {
     return esb_write_payload(&pkt);
 }
 
+#if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_RENDEZVOUS)
 int esb_transport_send_blocking(const uint8_t channel, const uint8_t pipe,
                                 const uint8_t *data, const uint8_t len,
                                 const k_timeout_t timeout) {
@@ -573,6 +970,7 @@ int esb_transport_send_blocking(const uint8_t channel, const uint8_t pipe,
     }
     return m_sync_tx_result_success ? 0 : -EIO;
 }
+#endif /* RENDEZVOUS */
 
 static uint32_t saved_bt_ll_ppi_chen;
 static bool bt_ll_suspended;
@@ -671,6 +1069,15 @@ void esb_transport_on_slot_start(void) {
     }
 
     consecutive_tx_fail = 0;
+#if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_HOP) && \
+    IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_ADAPTIVE_RETRY)
+    /* Reset adaptive state to the default (what esb_init_and_configure
+     * programmed) so the worker's cached value matches reality before
+     * the first EWMA sample arrives. */
+    m_adaptive_retransmit_count = CONFIG_ZMK_ESB_ENDPOINT_RETRANSMIT_COUNT;
+    k_work_reschedule(&m_adaptive_retry_work,
+                      K_MSEC(ADAPTIVE_RETRY_INTERVAL_MS));
+#endif
     LOG_DBG("ESB slot start OK (VTOR[RADIO]=0x%08x)",
             m_ram_vtor[16 + RADIO_IRQn]);
 }
@@ -678,6 +1085,10 @@ void esb_transport_on_slot_start(void) {
 void esb_transport_on_slot_stop(void) {
     LOG_DBG("ESB slot stop (ok=%u fail=%u)", tx_ok_count, tx_fail_count);
     consecutive_tx_fail = 0;
+#if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_HOP) && \
+    IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_ADAPTIVE_RETRY)
+    k_work_cancel_delayable(&m_adaptive_retry_work);
+#endif
 
     esb_disable();
 

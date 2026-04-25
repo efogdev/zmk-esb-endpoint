@@ -34,7 +34,7 @@
 #endif
 
 #include "zmk/ble.h"
-LOG_MODULE_REGISTER(zmk_esb_endpoint, CONFIG_ZMK_LOG_LEVEL);
+LOG_MODULE_REGISTER(zmk_esb_endpoint, CONFIG_ZMK_ESB_ENDPOINT_LOG_LEVEL);
 
 #if IS_ENABLED(CONFIG_ZMK_ADAPTIVE_FEEDBACK)
 #include <zmk_adaptive_feedback/adaptive_feedback.h>
@@ -227,7 +227,7 @@ static int esb_endpoint_init(void) {
 
 SYS_INIT(esb_endpoint_init, APPLICATION, CONFIG_APPLICATION_INIT_PRIORITY);
 
-#if IS_ENABLED(CONFIG_SHELL)
+#if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_SHELL_CMDS)
 static int cmd_esb_unpair(const struct shell *sh, const size_t argc, char **argv) {
     ARG_UNUSED(argc);
     ARG_UNUSED(argv);
@@ -317,4 +317,4 @@ SHELL_STATIC_SUBCMD_SET_CREATE(esb_cmds,
 );
 
 SHELL_CMD_REGISTER(esb, &esb_cmds, "ESB endpoint commands", NULL);
-#endif /* CONFIG_SHELL */
+#endif /* CONFIG_ZMK_ESB_ENDPOINT_SHELL_CMDS */

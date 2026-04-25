@@ -17,7 +17,7 @@
 #endif
 
 #include <zephyr/logging/log.h>
-LOG_MODULE_REGISTER(zmk_esb_pairing, CONFIG_ZMK_LOG_LEVEL);
+LOG_MODULE_REGISTER(zmk_esb_pairing, CONFIG_ZMK_ESB_ENDPOINT_LOG_LEVEL);
 
 #if IS_ENABLED(CONFIG_ZMK_ADAPTIVE_FEEDBACK)
 #include <zmk_adaptive_feedback/adaptive_feedback.h>
@@ -240,6 +240,9 @@ void pairing_on_rx(const uint8_t *data, const uint8_t len) {
 
 #if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_HOP)
     case ESB_PKT_CHANNEL_HOP_CONFIRM:
+    case ESB_PKT_HOP_ACCEPT:
+        /* channel_hop_ep_on_rx discriminates by data[0] — both PROPOSAL
+         * CONFIRMs and cooperative-hop ACCEPTs land here. */
         channel_hop_ep_on_rx(data, len);
         break;
 
@@ -247,6 +250,10 @@ void pairing_on_rx(const uint8_t *data, const uint8_t len) {
         channel_hop_ep_on_request();
         break;
 #endif
+
+    case ESB_PKT_LINK_STATS:
+        esb_transport_on_rx_link_stats(data, len);
+        break;
 
 #if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_SHELL_RELAY)
     case ESB_PKT_SHELL_REQ:

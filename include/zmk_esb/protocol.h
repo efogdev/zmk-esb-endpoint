@@ -228,3 +228,56 @@ struct esb_pkt_channel_hop_request {
 struct esb_pkt_idle {
     uint8_t type;      /* ESB_PKT_IDLE */
 } __attribute__((__packed__));
+
+/* Cooperative fast hop. Fires earlier than the existing TX-fail / silence
+ * triggers, in the "moderately degraded" link zone where retransmits are
+ * climbing but most packets still get through. Two-step handshake:
+ *
+ *   1. Endpoint sends HOP_OFFER {target, hop_in_ms, seq} on pipe 1.
+ *   2. Dongle queues HOP_ACCEPT {agreed, accepted, seq} in the ACK payload
+ *      and arms its commit timer for hop_in_ms - PRX_SETUP_BUDGET_MS from
+ *      OFFER-RX.
+ *   3. Endpoint TX_SUCCESS on the OFFER (the ACK that carried HOP_ACCEPT
+ *      was received) → endpoint arms its commit timer for hop_in_ms from
+ *      now, using the agreed channel from the ACCEPT.
+ *   4. Both commit_work fns fire within ~500 µs of each other; both
+ *      esb_set_rf_channel calls land near-simultaneously.
+ *
+ * Failure handling rides on existing recovery paths:
+ *   - OFFER TX_FAILED → endpoint never arms; if dongle armed (PRX heard
+ *     OFFER but ACK was lost) it disarms on the next non-OFFER endpoint
+ *     packet on the old channel; otherwise its validate_work handles it.
+ *   - Endpoint hops, dongle missed OFFER → existing silence watchdog +
+ *     speculative hop catches up.
+ */
+#define ESB_PKT_HOP_OFFER  0x18  /* keyboard→dongle (TX, pipe 1) */
+#define ESB_PKT_HOP_ACCEPT 0x19  /* dongle→keyboard (ACK, pipe 1) */
+
+struct esb_pkt_hop_offer {
+    uint8_t type;            /* ESB_PKT_HOP_OFFER */
+    uint8_t target_channel;  /* candidate next channel (0..100) */
+    uint8_t hop_in_ms;       /* deadline = OFFER-delivery + this many ms */
+    uint8_t seq;             /* 8-bit nonce, echoed in ACCEPT */
+} __attribute__((__packed__));
+
+struct esb_pkt_hop_accept {
+    uint8_t type;            /* ESB_PKT_HOP_ACCEPT */
+    uint8_t agreed_channel;  /* may differ from offered if counter-proposed */
+    uint8_t accepted;        /* 1 = exact match, 0 = counter-proposal */
+    uint8_t seq;             /* echoes OFFER's seq */
+} __attribute__((__packed__));
+
+/* LINK_STATS: dongle → keyboard (ACK payload, pipe 1)
+ * Periodic, low-priority telemetry — the dongle queues one every N RX
+ * packets while idle-unaware of other queued ACKs. The endpoint records
+ * the peer's view of the link so it can feed adaptive-retransmit and
+ * (future) TX-power decisions. Opportunistic: dropped on any higher-
+ * priority ACK via esb_prx_flush_acks() before queuing (see HOP_ACCEPT
+ * handling in channel_hop_dongle.c). */
+#define ESB_PKT_LINK_STATS   0x1A  /* dongle→keyboard (ACK, pipe 1) */
+
+struct esb_pkt_link_stats {
+    uint8_t type;       /* ESB_PKT_LINK_STATS */
+    int8_t  rssi_last;  /* dBm of most recent dongle RX */
+    int8_t  rssi_ewma;  /* dBm, EWMA over recent RXes */
+} __attribute__((__packed__));

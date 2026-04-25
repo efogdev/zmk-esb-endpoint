@@ -29,7 +29,7 @@
 #include "shell_relay.h"
 
 #include <zephyr/logging/log.h>
-LOG_MODULE_REGISTER(zmk_esb_shell, CONFIG_ZMK_LOG_LEVEL);
+LOG_MODULE_REGISTER(zmk_esb_shell, CONFIG_ZMK_ESB_ENDPOINT_LOG_LEVEL);
 
 static bool m_shell_active;
 
