@@ -18,6 +18,17 @@ static struct quarantine_state m_quarantine;
 static uint8_t m_committed_next = CHANNEL_HOP_INVALID;
 static bool m_link_up;
 
+/* True iff the current m_committed_next has been acknowledged by the
+ * dongle via CONFIRM AND nothing has happened since that could have
+ * invalidated the dongle's matching view. While true, periodic
+ * re-affirm PROPOSALs are suppressed — both sides already agree, so
+ * the steady-state TX is pure airtime overhead. The user-traffic ACK
+ * path carries a REQUEST whenever the dongle's committed_next is
+ * empty (see channel_hop_dongle_after_rx), so silent state loss on
+ * the dongle (reboot, speculative-hop validate fail) surfaces as a
+ * REQUEST on the very next user TX and flips this flag back to false. */
+static bool m_committed_synced;
+
 /* Channel we hopped away from on the most recent hop, iff no TX_SUCCESS
  * has been observed since that hop. If a subsequent hop fires while this
  * is still set, the new channel clearly isn't working either — revert
@@ -218,17 +229,23 @@ static void negotiate_work_fn(struct k_work *w) {
         quarantine_is(&m_quarantine, m_committed_next) ||
         m_committed_next == esb_transport_get_channel()) {
         needs_commit = true;
+        /* Fresh candidate — until CONFIRM lands, the dongle will hold
+         * a different value than we hold here. */
+        m_committed_synced = false;
         const uint8_t candidate = pick_candidate();
         if (candidate != CHANNEL_HOP_INVALID) {
             send_proposal(candidate);
         } else {
             LOG_WRN("no candidate channel available");
         }
-    } else {
-        /* Periodically re-affirm the existing committed channel so a
-         * dongle that rebooted picks up our view. */
+    } else if (!m_committed_synced) {
+        /* committed_next is valid but the dongle has signalled (REQUEST)
+         * or otherwise lost its view since the last CONFIRM — re-affirm
+         * with the channel we hold. */
         send_proposal(m_committed_next);
     }
+    /* else: both sides know and agree; skip the redundant TX. Silent
+     * dongle state loss surfaces via REQUEST in the next ACK. */
 
     /* Fast retry while we don't yet hold a valid committed_next OR while
      * a REQUEST burst is in flight — we need committed_next in place
@@ -396,11 +413,16 @@ static void post_hop_burst_work_fn(struct k_work *w) {
             K_MSEC(CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_HOP_RENDEZVOUS_TIMEOUT_MS));
         LOG_DBG("rendezvous PROPOSAL on ch=%u (proposed=%u): %d",
                 rendezvous, current, err);
-    } else if (candidate != CHANNEL_HOP_INVALID) {
+    } else if (candidate != CHANNEL_HOP_INVALID && !m_committed_synced) {
+        /* Skip once the first CONFIRM in this burst has landed: both
+         * sides hold `candidate` already and the remaining ticks would
+         * just re-affirm. The rendezvous side-trip above is unaffected
+         * — it targets a desynced dongle on a different channel and is
+         * never redundant. */
         send_proposal(candidate);
     }
 #else
-    if (candidate != CHANNEL_HOP_INVALID) {
+    if (candidate != CHANNEL_HOP_INVALID && !m_committed_synced) {
         send_proposal(candidate);
     }
 #endif /* RENDEZVOUS */
@@ -494,6 +516,7 @@ static void commit_hop_bookkeeping(uint8_t prev, uint32_t quarantine_ms) {
     quarantine_add(&m_quarantine, prev, quarantine_ms);
 
     m_committed_next = CHANNEL_HOP_INVALID;
+    m_committed_synced = false;
 
     m_hop_cooldown_until = k_uptime_get_32() +
         CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_HOP_COOLDOWN_MS;
@@ -604,6 +627,7 @@ static void hop_work_fn(struct k_work *w) {
                 current, target);
 
         m_committed_next = CHANNEL_HOP_INVALID;
+        m_committed_synced = false;
         m_hop_cooldown_until = k_uptime_get_32() +
             CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_HOP_COOLDOWN_MS;
         {
@@ -778,6 +802,7 @@ void channel_hop_ep_on_link_degraded_isr(void) {
 void channel_hop_ep_init(void) {
     quarantine_reset(&m_quarantine);
     m_committed_next = CHANNEL_HOP_INVALID;
+    m_committed_synced = false;
     m_prev_channel = CHANNEL_HOP_INVALID;
     m_active = false;
     m_post_hop_burst_remaining = 0;
@@ -817,6 +842,7 @@ void channel_hop_ep_on_disconnected(void) {
     m_link_up = false;
     m_active = false;
     m_committed_next = CHANNEL_HOP_INVALID;
+    m_committed_synced = false;
     m_prev_channel = CHANNEL_HOP_INVALID;
     m_post_hop_burst_remaining = 0;
     m_hop_cooldown_until = 0;
@@ -892,6 +918,10 @@ void channel_hop_ep_on_rx(const uint8_t *data, uint8_t len) {
     }
     const bool was_missing = (m_committed_next == CHANNEL_HOP_INVALID);
     m_committed_next = c->agreed;
+    /* Both sides now hold the same agreed channel — suppress the
+     * periodic re-affirm and the post-hop burst tail until something
+     * surfaces that could desync us again. */
+    m_committed_synced = true;
     /* CONFIRM means the dongle has committed_next populated again, so
      * any in-flight REQUEST burst is no longer needed — drop the
      * counter so we don't keep hammering at fast retry while the link
@@ -930,6 +960,11 @@ void channel_hop_ep_on_request(void) {
      * burst, not stacked bursts. */
     m_request_burst_remaining =
         CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_HOP_REQUEST_BURST_COUNT;
+    /* Dongle just told us its committed_next is INVALID — even if our
+     * own m_committed_next is still valid, the two views no longer
+     * match. Force the next negotiate_work_fn / post_hop_burst_work_fn
+     * to actually transmit the PROPOSAL instead of skipping it. */
+    m_committed_synced = false;
     k_work_reschedule(&negotiate_work, K_NO_WAIT);
     LOG_INF("REQUEST received — burst of %u PROPOSAL attempts + hop trigger",
             m_request_burst_remaining);
