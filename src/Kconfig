@@ -307,6 +307,20 @@ config ZMK_ESB_ENDPOINT_CHANNEL_HOP_POST_QUIET_MS
       also delayed by this amount so its first packet lands after the
       dongle has had a chance to settle.
 
+config ZMK_ESB_ENDPOINT_MOTION_MAX_STALE_MS
+    int "Drop accumulated pointer motion older than this (ms)"
+    default 100
+    range 1 1000
+    help
+      Maximum age of accumulated pointer deltas in the ESB input
+      processor before they are dropped instead of flushed. Dropping
+      stale motion prevents a post-quiet catch-up flush from teleporting
+      the cursor by tens of accumulated deltas after a long stall
+      (post-hop quiet, sync-TX side-trip, radio issue). Should sit
+      between one HID frame (~1 ms at 1 kHz) and CHANNEL_HOP_POST_QUIET_MS
+      plus a few radio retries. Button edges always flush regardless of
+      staleness.
+
 config ZMK_ESB_ENDPOINT_CHANNEL_QUARANTINE_MS
     int "Quarantine hold time for a bad channel (ms)"
     default 45000

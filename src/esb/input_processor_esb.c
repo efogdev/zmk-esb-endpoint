@@ -22,13 +22,16 @@
 #include <zephyr/logging/log.h>
 LOG_MODULE_REGISTER(zmk_esb_input_proc, CONFIG_ZMK_ESB_ENDPOINT_LOG_LEVEL);
 
-/* Dropping stale motion prevents a post-quiet catch-up flush from
- * teleporting the cursor by tens of accumulated deltas. Tuned to sit
- * between one HID frame (~1 ms at 1 kHz) and the post-hop quiet window
- * (CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_HOP_POST_QUIET_MS, default 3 ms) plus
- * a few radio retries; ~20 ms catches genuine drop-outs without
- * discarding legitimate motion through normal queue pressure. */
-#define ESB_IP_MOTION_MAX_STALE_MS 20u
+#define ESB_IP_MOTION_MAX_STALE_MS ((uint32_t)CONFIG_ZMK_ESB_ENDPOINT_MOTION_MAX_STALE_MS)
+
+/* Capacity of the per-instance button-edge queue used to defer reports
+ * past a transport-quiet window. Sized for a press-and-release pair
+ * with margin; further edges shift the oldest out so the final queued
+ * state still matches d->buttons. */
+#define ESB_IP_PENDING_BTN_QUEUE 4u
+
+/* Retry cadence while waiting for esb_transport_is_quiet() to clear. */
+#define ESB_IP_QUIET_RETRY_MS 1u
 
 struct esb_ip_data {
     int32_t dx;
@@ -40,17 +43,93 @@ struct esb_ip_data {
      * collecting. Zero means "accumulator empty / just reset"; set on
      * first non-zero delta after a reset, cleared on every send. */
     uint32_t accum_start_ms;
+    /* Snapshots of d->buttons captured when a button edge fell during a
+     * transport-quiet window. Drained in order by retry_work once the
+     * quiet window ends so the host sees each press/release edge. */
+    uint8_t pending_buttons[ESB_IP_PENDING_BTN_QUEUE];
+    uint8_t pending_count;
+    struct k_work_delayable retry_work;
 };
 
-static void send_mouse_report(struct esb_ip_data *d, bool button_changed) {
-    /* Coalesce motion during post-hop quiet / sync-TX side-trip: the
-     * transport would silently drop the send anyway (and we'd lose the
-     * accumulated dx/dy). Button edges still need to land immediately
-     * — a stuck click is worse than an oversized catch-up delta, and
-     * the saturation in CLAMP below bounds the worst case. */
-    if (!button_changed && esb_transport_is_quiet()) {
+static void send_hid_report_raw(uint8_t buttons, int32_t dx, int32_t dy,
+                                int32_t scroll_x, int32_t scroll_y) {
+    const struct zmk_hid_mouse_report_body body = {
+        .buttons    = buttons,
+        .d_x        = (int16_t)CLAMP(dx,       INT16_MIN, INT16_MAX),
+        .d_y        = (int16_t)CLAMP(dy,       INT16_MIN, INT16_MAX),
+        .d_scroll_y = (int16_t)CLAMP(scroll_y, INT16_MIN, INT16_MAX),
+        .d_scroll_x = (int16_t)CLAMP(scroll_x, INT16_MIN, INT16_MAX),
+    };
+    struct esb_pkt_hid_report pkt = {
+        .type        = ESB_PKT_HID_REPORT,
+        .report_type = ESB_REPORT_MOUSE,
+    };
+    memcpy(pkt.data, &body, sizeof(body));
+    esb_transport_send(ESB_PIPE_DATA, (uint8_t *)&pkt, sizeof(pkt));
+}
+
+static void enqueue_pending_button(struct esb_ip_data *d) {
+    if (d->pending_count >= ESB_IP_PENDING_BTN_QUEUE) {
+        /* Drop the oldest so the queue still ends on the latest state.
+         * An overrun means more edges happened in the quiet window than
+         * we budgeted for; preserving the final state matters more than
+         * any one intermediate edge. */
+        memmove(&d->pending_buttons[0], &d->pending_buttons[1],
+                ESB_IP_PENDING_BTN_QUEUE - 1u);
+        d->pending_count = ESB_IP_PENDING_BTN_QUEUE - 1u;
+    }
+    d->pending_buttons[d->pending_count++] = d->buttons;
+}
+
+/* Replays queued button-edge snapshots in order as buttons-only HID
+ * reports. Caller must verify the transport is no longer quiet, and is
+ * responsible for the trailing "current state" report (with motion)
+ * once the queue has drained. */
+static void drain_pending_buttons(struct esb_ip_data *d) {
+    for (uint8_t i = 0; i < d->pending_count; i++) {
+        send_hid_report_raw(d->pending_buttons[i], 0, 0, 0, 0);
+    }
+    d->pending_count = 0;
+}
+
+static void retry_work_fn(struct k_work *work) {
+    struct k_work_delayable *dw = k_work_delayable_from_work(work);
+    struct esb_ip_data *d = CONTAINER_OF(dw, struct esb_ip_data, retry_work);
+
+    if (esb_transport_is_quiet()) {
+        k_work_reschedule(&d->retry_work, K_MSEC(ESB_IP_QUIET_RETRY_MS));
         return;
     }
+    drain_pending_buttons(d);
+
+    /* Motion that accumulated during the quiet window is stale by
+     * definition: by the time the host sees it, it describes where the
+     * cursor was during the stall. Clearing the accumulator here also
+     * resets accum_start_ms so fresh post-quiet motion is not silently
+     * dropped by the stale-motion check off the old timestamp. */
+    d->dx = d->dy = d->scroll_x = d->scroll_y = 0;
+    d->accum_start_ms = 0;
+}
+
+static void send_mouse_report(struct esb_ip_data *d, bool button_changed) {
+    /* Quiet window (post-hop quiet, sync-TX side-trip): the transport
+     * silently drops anything we hand it. Coalesce motion in the
+     * accumulator and queue button edges so the host eventually sees
+     * each press/release in order — sending now would lose them. */
+    if (esb_transport_is_quiet()) {
+        if (button_changed) {
+            enqueue_pending_button(d);
+            k_work_reschedule(&d->retry_work, K_MSEC(ESB_IP_QUIET_RETRY_MS));
+        }
+        return;
+    }
+
+    /* Quiet ended while button edges were queued: replay each as a
+     * buttons-only report so the host sees every press/release in
+     * order, then fall through to send the current state (which may
+     * differ from the last queue entry if a button edge happened after
+     * quiet ended but before this call). No-op when the queue is empty. */
+    drain_pending_buttons(d);
 
     /* Drop motion that accumulated longer ago than MOTION_MAX_STALE_MS.
      * Happens when a long stall (post-hop quiet, sync-TX, radio issue)
@@ -69,20 +148,7 @@ static void send_mouse_report(struct esb_ip_data *d, bool button_changed) {
         }
     }
 
-    const struct zmk_hid_mouse_report_body body = {
-        .buttons    = d->buttons,
-        .d_x        = (int16_t)CLAMP(d->dx,       INT16_MIN, INT16_MAX),
-        .d_y        = (int16_t)CLAMP(d->dy,       INT16_MIN, INT16_MAX),
-        .d_scroll_y = (int16_t)CLAMP(d->scroll_y, INT16_MIN, INT16_MAX),
-        .d_scroll_x = (int16_t)CLAMP(d->scroll_x, INT16_MIN, INT16_MAX),
-    };
-
-    struct esb_pkt_hid_report pkt = {
-        .type        = ESB_PKT_HID_REPORT,
-        .report_type = ESB_REPORT_MOUSE,
-    };
-    memcpy(pkt.data, &body, sizeof(body));
-    esb_transport_send(ESB_PIPE_DATA, (uint8_t *)&pkt, sizeof(pkt));
+    send_hid_report_raw(d->buttons, d->dx, d->dy, d->scroll_x, d->scroll_y);
     d->dx = d->dy = d->scroll_x = d->scroll_y = 0;
     d->accum_start_ms = 0;
 }
@@ -151,6 +217,7 @@ static const struct zmk_input_processor_driver_api esb_ip_api = {
 static int esb_ip_init(const struct device *dev) {
     struct esb_ip_data *d = dev->data;
     memset(d, 0, sizeof(*d));
+    k_work_init_delayable(&d->retry_work, retry_work_fn);
     return 0;
 }
 

@@ -63,8 +63,8 @@ CONNECTED, so input can't leak to the wrong host.
 ## Dongle
 
 You bring your own PRX. The wire protocol is in `include/zmk_esb/protocol.h`.
-Core HID path is five message types (BEACON / PAIR_REQ / PAIR_RESP /
-HID_REPORT / DISCONNECT); HID report bodies are ZMK's `zmk_hid_*_report_body`
+Core HID path is five message types (`BEACON` / `PAIR_REQ` / `PAIR_RESP` /
+`HID_REPORT` / `DISCONNECT`); HID report bodies are ZMK's `zmk_hid_*_report_body`
 structs copied verbatim into an ESB payload, so the dongle can hand them
 straight to USB HID with nothing more than the report-id prefix byte. The
 PAIR_REQ ACK is expected to carry the dongle's 6-byte `device_id`, and a
@@ -89,8 +89,12 @@ Mouse reports are sent with `noack=1` when `ZMK_ESB_ENDPOINT_HID_NOACK=y` —
 a dropped pointer frame is self correcting. Keyboard and consumer reports
 are always ACKed; a lost release packet would strand a key on the host.
 Mouse motion accumulated during a transport quiet window (post-hop / sync
-side-trip) is dropped if it ages past ~20 ms so a flush doesn't teleport
-the cursor by tens of stale deltas; button edges always go through.
+side-trip) is dropped if it ages past
+`ZMK_ESB_ENDPOINT_MOTION_MAX_STALE_MS` so a flush doesn't teleport the
+cursor by tens of stale deltas. Button edges that fall in the same
+window are queued (small fixed depth, oldest-first eviction on overrun)
+and replayed in order once the window ends, so press/release pairs land
+on the host even when the radio was unavailable.
 
 ## Keymap behaviors
 
@@ -200,6 +204,7 @@ Channel hopping (`ZMK_ESB_ENDPOINT_CHANNEL_HOP`):
 | `..._CHANNEL_HOP_TX_FAIL_WINDOW_MS` | Continuous-fail duration that fires a dead-link hop. |
 | `..._CHANNEL_HOP_WEAK_LINK_MS`      | No-`TX_SUCCESS` duration that fires a weak-link hop (0 = off). |
 | `..._CHANNEL_HOP_POST_QUIET_MS`     | Quiet window after a hop before TX resumes. |
+| `..._MOTION_MAX_STALE_MS`           | Max age of accumulated pointer deltas before they are dropped instead of flushed. |
 | `..._CHANNEL_HOP_COOLDOWN_MS`       | Minimum dwell before another TX-fail hop can fire. |
 | `..._CHANNEL_QUARANTINE_MS`         | How long a recently-bad channel stays excluded. |
 | `..._CHANNEL_QUARANTINE_MIN_DISTANCE` | MHz of guard around any quarantined channel. |
