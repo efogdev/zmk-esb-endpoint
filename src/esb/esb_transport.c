@@ -110,6 +110,17 @@ static uint32_t tx_retried_count;      /* ACKed events with tx_attempts > 1 */
 static uint32_t tx_exhausted_count;    /* packets that died after all retries */
 static uint32_t consecutive_tx_fail;
 
+#if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_CRITICAL_MAX_RETRANSMIT)
+/* Parallel ring tracking which recent sends had the override applied.
+ * Independent from m_recent_noack[] (which only exists when CHANNEL_HOP is
+ * compiled in) so the critical-packet feature works for BEACON/PAIR_RESP/
+ * VERIFY_REQ/DISCONNECT even with channel hopping disabled. */
+#define CRIT_OVERRIDE_RING_SIZE 8
+static uint8_t  m_recent_critical_override[CRIT_OVERRIDE_RING_SIZE];
+static uint8_t  m_recent_critical_head;
+static uint8_t  m_recent_critical_tail;
+#endif /* CRITICAL_MAX_RETRANSMIT */
+
 #if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_HOP)
 #if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_ADAPTIVE_RETRY)
 /* Adaptive retransmit count state. Recomputed periodically from
@@ -378,6 +389,39 @@ static void adaptive_retry_work_fn(struct k_work *work) {
 #endif /* ADAPTIVE_RETRY */
 #endif
 
+#if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_CRITICAL_MAX_RETRANSMIT)
+/* Pop one entry from the critical-override ring. Returns true if the matching
+ * send pushed the radio to CRITICAL_RETRANSMIT_COUNT — the caller restores
+ * the retransmit count in that case. Ring-empty returns false (benign: nothing
+ * to restore). Called from the ESB event handler in lockstep with the send
+ * push, so head/tail stay aligned. */
+static bool consume_recent_override(void) {
+    if (m_recent_critical_tail == m_recent_critical_head) {
+        return false;
+    }
+    const bool was_override =
+        m_recent_critical_override[m_recent_critical_tail & (CRIT_OVERRIDE_RING_SIZE - 1)] != 0;
+    m_recent_critical_tail++;
+    return was_override;
+}
+
+/* Restore the radio's retransmit count after a critical-packet TX completes.
+ * Returns to the adaptive value if adaptive retry is compiled in, otherwise
+ * the static Kconfig default. Best-effort — -EBUSY just means the radio is
+ * mid-cycle on a back-to-back send; the next consume_recent_override or
+ * adaptive tick resyncs. */
+static void restore_retransmit_count(void) {
+    const uint8_t restore =
+#if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_HOP) && \
+    IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_ADAPTIVE_RETRY)
+        m_adaptive_retransmit_count;
+#else
+        (uint8_t)CONFIG_ZMK_ESB_ENDPOINT_RETRANSMIT_COUNT;
+#endif
+    (void)esb_set_retransmit_count(restore);
+}
+#endif
+
 static void zmk_esb_transport_evt_cb(struct esb_evt const *event) {
     switch (event->evt_id) {
     case ESB_EVENT_TX_SUCCESS:
@@ -455,6 +499,11 @@ static void zmk_esb_transport_evt_cb(struct esb_evt const *event) {
 #endif
 #if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_BENCH)
         esb_bench_notify_tx_success();
+#endif
+#if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_CRITICAL_MAX_RETRANSMIT)
+        if (consume_recent_override()) {
+            restore_retransmit_count();
+        }
 #endif
         break;
 
@@ -560,6 +609,11 @@ static void zmk_esb_transport_evt_cb(struct esb_evt const *event) {
 #endif
 #if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_BENCH)
         esb_bench_notify_tx_fail();
+#endif
+#if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_CRITICAL_MAX_RETRANSMIT)
+        if (consume_recent_override()) {
+            restore_retransmit_count();
+        }
 #endif
         esb_flush_tx();
         break;
@@ -713,6 +767,14 @@ int esb_transport_set_channel(const uint8_t channel) {
      * push entries we'll never see TX events for (esb_flush_tx above).
      * Restarting tail at head keeps consume_recent_noack happy. */
     m_recent_noack_tail = m_recent_noack_head;
+#if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_CRITICAL_MAX_RETRANSMIT)
+    /* Same drain for the override ring. After a flushed hop, force the
+     * radio back to the non-override count so HID resumed on the new
+     * channel doesn't sit at the elevated retransmit count waiting for
+     * an event that will never come. */
+    m_recent_critical_tail = m_recent_critical_head;
+    restore_retransmit_count();
+#endif
     /* Arm the post-hop quiet window. Any send() during this interval is
      * silently dropped — the dongle may still be on the old channel and
      * anything we transmit would just fail and feed the next hop trigger.
@@ -832,9 +894,10 @@ int esb_transport_send(const uint8_t pipe, const uint8_t *data, uint8_t len) {
 #if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_HOP)
     /* Post-hop quiet window: the dongle needs a moment to follow us to
      * the new channel. Silently drop user traffic until the deadline —
-     * 32-bit wrap-safe compare. Losing ~10 ms of HID reports is strictly
-     * better than queueing them for a channel the receiver hasn't
-     * reached yet, where every attempt would just count as a failure. */
+     * 32-bit wrap-safe compare. Losing CHANNEL_HOP_POST_QUIET_MS worth of
+     * HID reports is strictly better than queueing them for a channel the
+     * receiver hasn't reached yet, where every attempt would just count
+     * as a failure. */
     if (m_tx_quiet_until_ms != 0) {
         const uint32_t now = k_uptime_get_32();
         if ((int32_t)(m_tx_quiet_until_ms - now) > 0) {
@@ -903,6 +966,35 @@ int esb_transport_send(const uint8_t pipe, const uint8_t *data, uint8_t len) {
         if (is_user_traffic) {
             channel_hop_ep_note_user_tx();
         }
+    }
+#endif
+
+#if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_CRITICAL_MAX_RETRANSMIT)
+    /* Critical-packet retransmit override. For pairing, control, hop
+     * coordination, and silence packets, push the radio to the hardware
+     * maximum so a single dropped frame can't strand pairing or leave
+     * the link on a degraded channel. The matching TX event in
+     * zmk_esb_transport_evt_cb consumes the ring tail and restores the
+     * count. The push runs every send (override or not) so head/tail
+     * stay aligned with the TX events. */
+    const bool critical_override = (len >= 1) && (
+        data[0] == ESB_PKT_BEACON               ||
+        data[0] == ESB_PKT_PAIR_RESP            ||
+        data[0] == ESB_PKT_DISCONNECT           ||
+        data[0] == ESB_PKT_VERIFY_REQ           ||
+        data[0] == ESB_PKT_CHANNEL_HOP_PROPOSAL ||
+        data[0] == ESB_PKT_HOP_OFFER            ||
+        data[0] == ESB_PKT_IDLE);
+    m_recent_critical_override[m_recent_critical_head & (CRIT_OVERRIDE_RING_SIZE - 1)] =
+        critical_override ? 1U : 0U;
+    m_recent_critical_head++;
+    if (critical_override) {
+        /* Best effort: -EBUSY just means another TX is mid-cycle and
+         * already locked in its retransmit_count. Our payload sits in
+         * the queue; ESB picks up the new count at the next IDLE
+         * transition before pulling our entry. */
+        (void)esb_set_retransmit_count(
+            CONFIG_ZMK_ESB_ENDPOINT_CRITICAL_RETRANSMIT_COUNT);
     }
 #endif
 
@@ -995,12 +1087,13 @@ static void bt_ll_resume(void) {
 }
 
 /*
- * The LFRC calibrator (CONFIG_CLOCK_CONTROL_NRF_K32SRC_RC + default 4000ms period,
- * MAX_SKIP=1) does onoff_request / onoff_release on the HF subsystem every 4s —
- * when the refcount drops back to 0 the driver issues HFCLKSTOP.  Every 8s a
- * full hardware calibration runs, giving the RADIO just long enough to push a
- * burst of ESB frames.  Hold a persistent HF request while ESB is active so the
- * calibrator's release goes 1 -> 0 never happens and HFXO stays on continuously.
+ * The LFRC calibrator (CONFIG_CLOCK_CONTROL_NRF_K32SRC_RC, configurable period
+ * with MAX_SKIP) does onoff_request / onoff_release on the HF subsystem each
+ * period — when the refcount drops back to 0 the driver issues HFCLKSTOP.
+ * Every (MAX_SKIP+1) periods a full hardware calibration runs, giving the
+ * RADIO just long enough to push a burst of ESB frames.  Hold a persistent HF
+ * request while ESB is active so the calibrator's release going 1 -> 0 never
+ * happens and HFXO stays on continuously.
  */
 static struct onoff_client hfclk_cli;
 static bool hfclk_held;

@@ -14,6 +14,33 @@ LOG_MODULE_REGISTER(zmk_esb_chhop_ep, CONFIG_ZMK_ESB_ENDPOINT_LOG_LEVEL);
 
 #if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_HOP)
 
+/* Compile-time invariants for the hop / rollback timing knobs. Cross-firmware
+ * constraints against DONGLE_* live on the dongle side and cannot be checked
+ * here (the dongle Kconfig is not visible in the endpoint build); see each
+ * symbol's help text for those. */
+BUILD_ASSERT(CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_HOP_WEAK_LINK_MS == 0 ||
+             CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_HOP_WEAK_LINK_MS >
+             CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_HOP_TX_FAIL_WINDOW_MS,
+             "WEAK_LINK_MS (when nonzero) must exceed TX_FAIL_WINDOW_MS so "
+             "the fast dead-link trigger fires before the weak-link path");
+BUILD_ASSERT(CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_HOP_RENDEZVOUS_FALLBACK_MS == 0 ||
+             CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_HOP_RENDEZVOUS_FALLBACK_MS <
+             CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_HOP_COOLDOWN_MS,
+             "RENDEZVOUS_FALLBACK_MS (when nonzero) must be < COOLDOWN_MS or "
+             "the fallback can never fire — the cooldown gate elapses first");
+BUILD_ASSERT(CONFIG_ZMK_ESB_ENDPOINT_MOTION_MAX_STALE_MS >=
+             CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_HOP_POST_QUIET_MS,
+             "MOTION_MAX_STALE_MS must be >= POST_QUIET_MS or accumulated "
+             "motion is dropped before the post-hop quiet window even ends");
+BUILD_ASSERT(CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_HOP_NEGOTIATE_INTERVAL_MS >
+             CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_HOP_NEGOTIATE_RETRY_MS,
+             "Steady-state NEGOTIATE_INTERVAL_MS must be larger than the "
+             "fast-retry NEGOTIATE_RETRY_MS or the 'fast' path is no faster");
+BUILD_ASSERT(CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_HOP_RENDEZVOUS_TIMEOUT_MS <
+             CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_HOP_POST_BURST_INTERVAL_MS,
+             "RENDEZVOUS_TIMEOUT_MS must be < POST_BURST_INTERVAL_MS so the "
+             "rendezvous side-trip cannot stall past the next burst tick");
+
 static struct quarantine_state m_quarantine;
 static uint8_t m_committed_next = CHANNEL_HOP_INVALID;
 static bool m_link_up;
@@ -79,11 +106,12 @@ static uint8_t m_request_burst_remaining;
 
 /* Uptime (ms, 32-bit wrap-safe compare) until which TX-fail-triggered hops
  * are suppressed. Set when a hop commits so the endpoint lingers on the new
- * channel long enough for the dongle's silence watchdog (default 275 ms) and
- * validate window (default 350 ms) to fire. Without this, 3 consecutive TX
- * fails (~30 ms on a dead link) bounce the endpoint off the new channel
- * before the dongle ever arrives, so the speculative hop always validates
- * against an empty channel. Zero means "no cooldown active". */
+ * channel long enough for the dongle's silence watchdog
+ * (DONGLE_CHANNEL_HOP_RX_SILENCE_MS) and validate window
+ * (DONGLE_CHANNEL_HOP_VALIDATE_MS) to fire. Without this, a short burst of
+ * consecutive TX fails on a dead link can bounce the endpoint off the new
+ * channel before the dongle ever arrives, so the speculative hop always
+ * validates against an empty channel. Zero means "no cooldown active". */
 static uint32_t m_hop_cooldown_until;
 
 /* Uptime (ms) of the most recent positive link event on the current
@@ -94,12 +122,12 @@ static uint32_t m_hop_cooldown_until;
  * justify bypassing the cooldown and forcing a rendezvous hop.
  *
  * Earlier revisions zeroed this on TX_SUCCESS. That made one lucky packet
- * inside the 2500 ms cooldown permanently disable fallback for the rest
+ * inside the cooldown window permanently disable fallback for the rest
  * of the cooldown — even if the link went dead immediately afterwards.
- * With two such success→silence cycles back-to-back (cooldown is 2500 ms),
- * the endpoint could sit without firing any hop for ~5 s. Refreshing to
- * now on TX_SUCCESS keeps the "no activity for RENDEZVOUS_FALLBACK_MS"
- * invariant correct across intermittent links.
+ * With two such success→silence cycles back-to-back the endpoint could
+ * sit without firing any hop for roughly twice CHANNEL_HOP_COOLDOWN_MS.
+ * Refreshing to now on TX_SUCCESS keeps the "no activity for
+ * RENDEZVOUS_FALLBACK_MS" invariant correct across intermittent links.
  *
  * Zero still means "no hop has ever committed" — set only by init /
  * disconnect and preserved as the fallback's "is there anything to fall
@@ -159,11 +187,6 @@ static uint32_t m_coop_hop_cooldown_until;
 static struct k_work_delayable coop_hop_offer_work;
 static struct k_work_delayable coop_hop_commit_work;
 #endif /* COOP_HOP */
-
-/* Delay before re-submitting hop_work after a failed esb_transport_set_channel.
- * -EBUSY resolves within one or two TX slots (retransmit_delay is 470us,
- * retransmit_count=2, so ~1.5ms for a drain). 5ms is a comfortable buffer. */
-#define HOP_RETRY_DELAY_MS 5
 
 static bool hop_cooldown_active(void) {
     if (m_hop_cooldown_until == 0) {
@@ -435,6 +458,18 @@ static void post_hop_burst_work_fn(struct k_work *w) {
          * picks fresh (the link state may have changed since this burst
          * started). */
         m_post_hop_burst_candidate = CHANNEL_HOP_INVALID;
+        /* If the device went idle during the burst, the trailing
+         * PROPOSALs we just sent flipped the dongle back to
+         * peer_idle=false (every non-IDLE packet does), re-arming its
+         * silence watchdog. enter_idle_state's IDLE burst landed
+         * earlier in the sequence and was overwritten by these
+         * PROPOSALs. Re-send IDLE now so peer_idle=true is the last
+         * state the dongle sees on this channel — otherwise
+         * silence_work fires after RX_SILENCE_MS and triggers a
+         * speculative hop into a stale committed_next. */
+        if (!m_active) {
+            send_idle_packet();
+        }
     }
 }
 
@@ -467,7 +502,7 @@ static void enter_active_state(bool send_initial_proposal) {
         k_work_reschedule(&negotiate_work, K_NO_WAIT);
     } else {
         /* Idle→active transition: fire negotiate at fast-retry tempo
-         * (~200 ms) instead of the slow INTERVAL. The dongle's
+         * (NEGOTIATE_RETRY_MS) instead of the slow INTERVAL. The dongle's
          * committed_next may have been wiped during the idle period —
          * a successful speculative-hop validation on the dongle while
          * we were silent clears its target and there's no inbound
@@ -602,14 +637,14 @@ static void hop_work_fn(struct k_work *w) {
     const int err = esb_transport_set_channel(target);
     if (err) {
         LOG_ERR("channel hop %u -> %u failed: %d (will retry in %ums)",
-                current, target, err, (unsigned)HOP_RETRY_DELAY_MS);
+                current, target, err, (unsigned)CONFIG_ZMK_ESB_ENDPOINT_HOP_RETRY_DELAY_MS);
         /* -EBUSY here means the PTX is in PTX_TX/PTX_TX_ACK/PTX_TXIDLE and
          * we lack fast-channel-switching. Leave committed_next, m_prev,
          * and quarantine intact so the retry can make the same decision.
          * Reset the fail counter so the TX ISR's modulo trigger re-arms
          * and a new burst of fails still retriggers us. */
         esb_transport_reset_consecutive_fail();
-        k_work_reschedule(&hop_retry_work, K_MSEC(HOP_RETRY_DELAY_MS));
+        k_work_reschedule(&hop_retry_work, K_MSEC(CONFIG_ZMK_ESB_ENDPOINT_HOP_RETRY_DELAY_MS));
         return;
     }
 
@@ -750,7 +785,7 @@ static void coop_hop_commit_work_fn(struct k_work *w) {
         m_coop_hop_state = COOP_IDLE;
         /* Reuse the existing retry path — the TX-fail trigger will
          * re-fire if the link is genuinely bad. */
-        k_work_reschedule(&hop_retry_work, K_MSEC(HOP_RETRY_DELAY_MS));
+        k_work_reschedule(&hop_retry_work, K_MSEC(CONFIG_ZMK_ESB_ENDPOINT_HOP_RETRY_DELAY_MS));
         return;
     }
 
@@ -1015,12 +1050,12 @@ void channel_hop_ep_on_tx_fail_isr(void) {
     }
     /* Post-hop cooldown: after a recent hop, give the dongle time to fire
      * its own silence watchdog (RX_SILENCE_MS) and validate the speculative
-     * hop (VALIDATE_MS) before we consider hopping again. Without this we
-     * bounce off the new channel in ~30 ms, far before the dongle (275 ms
-     * silence) ever arrives there, so the speculative hop always validates
-     * against an empty channel. The post-hop PROPOSAL burst continues
-     * firing during cooldown regardless — that's precisely what gives the
-     * dongle a packet to confirm against. */
+     * hop (VALIDATE_MS) before we consider hopping again. Without this a
+     * short burst of TX fails on a dead link bounces us off the new channel
+     * far before the dongle's silence watchdog ever arrives there, so the
+     * speculative hop always validates against an empty channel. The
+     * post-hop PROPOSAL burst continues firing during cooldown regardless
+     * — that's precisely what gives the dongle a packet to confirm against. */
     if (hop_cooldown_active()) {
 #if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_RENDEZVOUS)
         /* Cooldown rendezvous fallback: if no positive link event (hop
