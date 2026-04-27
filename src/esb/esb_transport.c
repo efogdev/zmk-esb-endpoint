@@ -110,6 +110,20 @@ static uint32_t tx_retried_count;      /* ACKed events with tx_attempts > 1 */
 static uint32_t tx_exhausted_count;    /* packets that died after all retries */
 static uint32_t consecutive_tx_fail;
 
+/* HID-report TX rate observability. m_hid_tx_count is the lifetime count
+ * of ESB_PKT_HID_REPORT sends. m_hid_tx_bucket_count accumulates inside
+ * the current one-second bucket, committed to m_hid_tx_rate_hz when
+ * elapsed since m_hid_tx_bucket_ms crosses HID_RATE_BUCKET_MS. The
+ * getter treats m_hid_tx_rate_hz as stale once HID_RATE_STALE_MS has
+ * passed without a new send updating the bucket. All updates happen
+ * from the user-thread send path; reads are single-word loads. */
+#define HID_RATE_BUCKET_MS 1000U
+#define HID_RATE_STALE_MS  2000U
+static uint32_t m_hid_tx_count;
+static uint32_t m_hid_tx_bucket_count;
+static uint32_t m_hid_tx_bucket_ms;
+static uint16_t m_hid_tx_rate_hz;
+
 #if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_CRITICAL_MAX_RETRANSMIT)
 /* Parallel ring tracking which recent sends had the override applied.
  * Independent from m_recent_noack[] (which only exists when CHANNEL_HOP is
@@ -120,6 +134,65 @@ static uint8_t  m_recent_critical_override[CRIT_OVERRIDE_RING_SIZE];
 static uint8_t  m_recent_critical_head;
 static uint8_t  m_recent_critical_tail;
 #endif /* CRITICAL_MAX_RETRANSMIT */
+
+/* Pointer/scroll refund + per-send motion ring. When a mouse report whose
+ * deltas are non-zero exhausts its (lower) retransmit budget, the deltas
+ * are not lost: they are added (saturating to int16) to the next outgoing
+ * mouse report's d_x/d_y/d_scroll_*. Buttons are deliberately excluded —
+ * edge-triggered state cannot be reconstructed by accumulation, the
+ * input processor's pending_buttons queue handles edge replay separately.
+ *
+ * m_recent_motion[] mirrors the existing override / noack rings: one slot
+ * per esb_write_payload, popped one per TX event. On TX_FAILED we read the
+ * deltas back out of the slot into m_motion_refund. On TX_SUCCESS we just
+ * advance the tail. Same drift trade-off as m_recent_critical_override:
+ * esb_flush_tx() drops queued packets without firing TX events, leaving
+ * a few stale slots; the ring stays bounded so refund accumulation is
+ * bounded too.
+ *
+ * Refund is ALSO consumed on every mouse-report send (not just on the
+ * TX_FAILED that produced it) so a refund stranded by no further motion
+ * isn't kept forever. Stale refunds older than
+ * CONFIG_ZMK_ESB_ENDPOINT_POINTER_REFUND_STALE_MS are dropped at apply
+ * time (matches the input processor's MOTION_MAX_STALE_MS rationale:
+ * a long radio outage shouldn't produce a giant cursor jump when
+ * traffic resumes). */
+struct pointer_motion_record {
+    int16_t dx;
+    int16_t dy;
+    int16_t scroll_x;
+    int16_t scroll_y;
+    uint8_t overrode;  /* radio's retransmit_count was lowered for this send */
+};
+static struct pointer_motion_record
+    m_recent_motion[CONFIG_ZMK_ESB_ENDPOINT_POINTER_MOTION_RING_SIZE];
+/* uint32_t (not uint8_t like the other rings) because the Kconfig ring
+ * size is not constrained to a power of 2 — uint8 wrap (mod 256) would
+ * mis-index whenever 256 % SIZE != 0. % SIZE on a 32-bit counter stays
+ * correct for any SIZE; counters are bumped from a single ISR + the
+ * thread send path with the existing transport-wide synchronisation. */
+static uint32_t m_recent_motion_head;
+static uint32_t m_recent_motion_tail;
+
+static struct {
+    int32_t  dx;
+    int32_t  dy;
+    int32_t  scroll_x;
+    int32_t  scroll_y;
+    uint32_t stamp_ms;  /* 0 means empty */
+} m_motion_refund;
+
+/* Count of pointer-motion mouse reports currently sitting in the ESB TX
+ * FIFO (pushed via esb_write_payload, matching TX event not yet seen).
+ * Bumped by motion_ring_push for any send carrying non-zero deltas;
+ * decremented when motion_ring_consume pops the matching slot. Mirrors
+ * the (head - tail) gap on the motion ring but counts only mouse-with-
+ * motion entries — buttons-only mouse reports and non-mouse sends push
+ * zero records into the ring for symmetry but do not contribute to
+ * back-pressure. Zeroed by esb_flush_tx_and_reset() (every flush abandons
+ * its in-flight pointer sends along with the queue). The cap that gates
+ * back-pressure is CONFIG_ZMK_ESB_ENDPOINT_POINTER_INFLIGHT_CAP. */
+static uint8_t m_pointer_inflight_count;
 
 #if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_HOP)
 #if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_ADAPTIVE_RETRY)
@@ -132,15 +205,6 @@ static uint8_t  m_recent_critical_tail;
 static uint8_t m_adaptive_retransmit_count =
     CONFIG_ZMK_ESB_ENDPOINT_RETRANSMIT_COUNT;
 static struct k_work_delayable m_adaptive_retry_work;
-
-#define ADAPTIVE_RETRY_INTERVAL_MS 100u
-/* EWMA breakpoints (attempts × 10). Below LOW we're near the perfect
- * link (mostly 1-attempt packets) — drop to MIN. Above HIGH we're
- * retrying often — push to MAX. Linear between, rounded toward MIN. */
-#define ADAPTIVE_RETRY_EWMA_LOW    15u   /* 1.5 avg attempts */
-#define ADAPTIVE_RETRY_EWMA_HIGH   30u   /* 3.0 avg attempts */
-#define ADAPTIVE_RETRY_COUNT_MIN   4u
-#define ADAPTIVE_RETRY_COUNT_MAX   12u
 #endif /* ADAPTIVE_RETRY */
 
 /* Time-window TX-failure tracking. m_first_fail_ms holds the uptime at
@@ -219,6 +283,13 @@ static volatile bool m_link_degraded_armed;
  * on Cortex-M is atomic, so no lock is needed. */
 static uint32_t m_last_activity_ms;
 static bool     m_activity_seen;
+
+/* Uptime of the most recent ESB TX event (success or fail), regardless of
+ * sync_tx_in_progress / channel-hop state. Read by esb_transport_flush_tx
+ * to gate the public flush on radio silence. Stamped from the RADIO ISR;
+ * single-word Cortex-M access so no lock needed. 0 means "no event seen
+ * yet" — treated as silence by the gate. */
+static uint32_t m_last_tx_event_ms;
 
 /* xorshift32 state for retry-delay jitter. Seeded lazily on first use from
  * k_uptime_get_32 — we cannot rely on init ordering w.r.t. the kernel
@@ -360,17 +431,19 @@ __weak void channel_hop_ep_on_link_degraded_isr(void) {}
  * breakpoints; saturates at MIN / MAX outside. */
 static uint8_t adaptive_retry_target(void) {
     const uint16_t ewma = m_link_quality_ewma_x10;
-    if (ewma <= ADAPTIVE_RETRY_EWMA_LOW) {
-        return ADAPTIVE_RETRY_COUNT_MIN;
+    if (ewma <= CONFIG_ZMK_ESB_ENDPOINT_ADAPTIVE_RETRY_EWMA_LOW) {
+        return CONFIG_ZMK_ESB_ENDPOINT_ADAPTIVE_RETRY_COUNT_MIN;
     }
-    if (ewma >= ADAPTIVE_RETRY_EWMA_HIGH) {
-        return ADAPTIVE_RETRY_COUNT_MAX;
+    if (ewma >= CONFIG_ZMK_ESB_ENDPOINT_ADAPTIVE_RETRY_EWMA_HIGH) {
+        return CONFIG_ZMK_ESB_ENDPOINT_ADAPTIVE_RETRY_COUNT_MAX;
     }
-    const uint32_t span = ADAPTIVE_RETRY_EWMA_HIGH - ADAPTIVE_RETRY_EWMA_LOW;
-    const uint32_t into = ewma - ADAPTIVE_RETRY_EWMA_LOW;
+    const uint32_t span = CONFIG_ZMK_ESB_ENDPOINT_ADAPTIVE_RETRY_EWMA_HIGH -
+                          CONFIG_ZMK_ESB_ENDPOINT_ADAPTIVE_RETRY_EWMA_LOW;
+    const uint32_t into = ewma - CONFIG_ZMK_ESB_ENDPOINT_ADAPTIVE_RETRY_EWMA_LOW;
     const uint32_t delta =
-        (into * (ADAPTIVE_RETRY_COUNT_MAX - ADAPTIVE_RETRY_COUNT_MIN)) / span;
-    return (uint8_t)(ADAPTIVE_RETRY_COUNT_MIN + delta);
+        (into * (CONFIG_ZMK_ESB_ENDPOINT_ADAPTIVE_RETRY_COUNT_MAX -
+                 CONFIG_ZMK_ESB_ENDPOINT_ADAPTIVE_RETRY_COUNT_MIN)) / span;
+    return (uint8_t)(CONFIG_ZMK_ESB_ENDPOINT_ADAPTIVE_RETRY_COUNT_MIN + delta);
 }
 
 static void adaptive_retry_work_fn(struct k_work *work) {
@@ -384,10 +457,26 @@ static void adaptive_retry_work_fn(struct k_work *work) {
         }
     }
     k_work_reschedule(&m_adaptive_retry_work,
-                      K_MSEC(ADAPTIVE_RETRY_INTERVAL_MS));
+                      K_MSEC(CONFIG_ZMK_ESB_ENDPOINT_ADAPTIVE_RETRY_INTERVAL_MS));
 }
 #endif /* ADAPTIVE_RETRY */
 #endif
+
+/* Restore the radio's retransmit count after a per-packet override (critical
+ * or pointer) TX completes. Returns to the adaptive value if adaptive retry
+ * is compiled in, otherwise the static Kconfig default. Best-effort —
+ * -EBUSY just means the radio is mid-cycle on a back-to-back send; the
+ * next override consumer or adaptive tick resyncs. */
+static void restore_retransmit_count(void) {
+    const uint8_t restore =
+#if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_HOP) && \
+    IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_ADAPTIVE_RETRY)
+        m_adaptive_retransmit_count;
+#else
+        (uint8_t)CONFIG_ZMK_ESB_ENDPOINT_RETRANSMIT_COUNT;
+#endif
+    (void)esb_set_retransmit_count(restore);
+}
 
 #if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_CRITICAL_MAX_RETRANSMIT)
 /* Pop one entry from the critical-override ring. Returns true if the matching
@@ -404,25 +493,212 @@ static bool consume_recent_override(void) {
     m_recent_critical_tail++;
     return was_override;
 }
+#endif
 
-/* Restore the radio's retransmit count after a critical-packet TX completes.
- * Returns to the adaptive value if adaptive retry is compiled in, otherwise
- * the static Kconfig default. Best-effort — -EBUSY just means the radio is
- * mid-cycle on a back-to-back send; the next consume_recent_override or
- * adaptive tick resyncs. */
-static void restore_retransmit_count(void) {
-    const uint8_t restore =
-#if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_HOP) && \
-    IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_ADAPTIVE_RETRY)
-        m_adaptive_retransmit_count;
-#else
-        (uint8_t)CONFIG_ZMK_ESB_ENDPOINT_RETRANSMIT_COUNT;
-#endif
-    (void)esb_set_retransmit_count(restore);
+/* Mouse body laid out as the input processor packs it (zmk_hid_mouse_report_body
+ * memcpy'd into esb_pkt_hid_report.data). Local definition rather than including
+ * <zmk/hid.h> here — the transport layer is otherwise oblivious to the HID
+ * report shape. */
+struct esb_mouse_body {
+    uint8_t buttons;
+    int16_t d_x;
+    int16_t d_y;
+    int16_t d_scroll_y;
+    int16_t d_scroll_x;
+} __attribute__((__packed__));
+
+/* True if the payload bytes look like a mouse HID report packet — used to
+ * gate refund + pointer-retransmit override on the send / TX-event paths. */
+static inline bool is_mouse_report(const uint8_t *data, const uint8_t len) {
+    return len >= (2u + sizeof(struct esb_mouse_body)) &&
+           data[0] == ESB_PKT_HID_REPORT &&
+           data[1] == ESB_REPORT_MOUSE;
 }
+
+static inline struct esb_mouse_body *mouse_body_of(uint8_t *pkt_data) {
+    /* &pkt.data[2] in esb_pkt_hid_report = first byte of the mouse body. */
+    return (struct esb_mouse_body *)(pkt_data + 2);
+}
+
+static int16_t sat16(const int32_t v) {
+    if (v > INT16_MAX) return INT16_MAX;
+    if (v < INT16_MIN) return INT16_MIN;
+    return (int16_t)v;
+}
+
+/* Add any pending refund (saturating) into the outgoing mouse report's
+ * d_x/d_y/d_scroll_*. Residual that overflowed int16 stays in the pool
+ * for the next mouse send. Stale refunds (>= STALE_MS old) are dropped
+ * before applying. */
+static void motion_refund_apply(struct esb_mouse_body *body) {
+    if (m_motion_refund.stamp_ms != 0) {
+        const uint32_t age = k_uptime_get_32() - m_motion_refund.stamp_ms;
+        if (age >= CONFIG_ZMK_ESB_ENDPOINT_POINTER_REFUND_STALE_MS) {
+            m_motion_refund.dx = 0;
+            m_motion_refund.dy = 0;
+            m_motion_refund.scroll_x = 0;
+            m_motion_refund.scroll_y = 0;
+            m_motion_refund.stamp_ms = 0;
+            return;
+        }
+    }
+    if ((m_motion_refund.dx | m_motion_refund.dy |
+         m_motion_refund.scroll_x | m_motion_refund.scroll_y) == 0) {
+        return;
+    }
+    const int32_t total_dx = (int32_t)body->d_x + m_motion_refund.dx;
+    const int32_t total_dy = (int32_t)body->d_y + m_motion_refund.dy;
+    const int32_t total_sx = (int32_t)body->d_scroll_x + m_motion_refund.scroll_x;
+    const int32_t total_sy = (int32_t)body->d_scroll_y + m_motion_refund.scroll_y;
+    body->d_x        = sat16(total_dx);
+    body->d_y        = sat16(total_dy);
+    body->d_scroll_x = sat16(total_sx);
+    body->d_scroll_y = sat16(total_sy);
+    m_motion_refund.dx       = total_dx - body->d_x;
+    m_motion_refund.dy       = total_dy - body->d_y;
+    m_motion_refund.scroll_x = total_sx - body->d_scroll_x;
+    m_motion_refund.scroll_y = total_sy - body->d_scroll_y;
+    if ((m_motion_refund.dx | m_motion_refund.dy |
+         m_motion_refund.scroll_x | m_motion_refund.scroll_y) == 0) {
+        m_motion_refund.stamp_ms = 0;
+    }
+}
+
+/* Push the (post-refund) motion deltas of an outgoing send onto the ring,
+ * matching the slot the next TX event will consume. `overrode` records
+ * whether the radio's retransmit_count was lowered for this send so the
+ * matching event handler can restore. Non-mouse sends push a zero record
+ * to keep head/tail in lockstep with TX events. */
+static void motion_ring_push(const struct esb_mouse_body *body, const bool overrode) {
+    const uint32_t slot = m_recent_motion_head %
+        CONFIG_ZMK_ESB_ENDPOINT_POINTER_MOTION_RING_SIZE;
+    if (body) {
+        m_recent_motion[slot].dx       = body->d_x;
+        m_recent_motion[slot].dy       = body->d_y;
+        m_recent_motion[slot].scroll_x = body->d_scroll_x;
+        m_recent_motion[slot].scroll_y = body->d_scroll_y;
+    } else {
+        m_recent_motion[slot].dx = 0;
+        m_recent_motion[slot].dy = 0;
+        m_recent_motion[slot].scroll_x = 0;
+        m_recent_motion[slot].scroll_y = 0;
+    }
+    m_recent_motion[slot].overrode = overrode ? 1U : 0U;
+    /* Track in-flight pointer-with-motion sends for back-pressure. Only
+     * non-zero-delta pushes count — buttons-only mouse reports and non-
+     * mouse sends are recorded for ring/event symmetry but should not
+     * gate the input processor. Saturating cap on UINT8_MAX is paranoia:
+     * any reasonable inflight cap is far smaller, and a stuck counter
+     * would only over-back-pressure (correctness preserved). */
+    if (body && (body->d_x | body->d_y | body->d_scroll_x | body->d_scroll_y) &&
+        m_pointer_inflight_count < UINT8_MAX) {
+        m_pointer_inflight_count++;
+    }
+    m_recent_motion_head++;
+}
+
+/* Pop one entry from the motion ring on TX event. On TX_FAILED the
+ * deltas are added back to the refund pool (so the next mouse send
+ * picks them up); on TX_SUCCESS the slot is just consumed. If the
+ * popped slot had `overrode` set, the caller restores the radio's
+ * retransmit count. Ring-empty pop is benign — flush_tx can drop a
+ * push without the matching event ever arriving (same trade-off the
+ * critical-override and noack rings document). */
+static void motion_ring_consume(const bool failed) {
+    if (m_recent_motion_tail == m_recent_motion_head) {
+        return;
+    }
+    const uint32_t slot = m_recent_motion_tail %
+        CONFIG_ZMK_ESB_ENDPOINT_POINTER_MOTION_RING_SIZE;
+    const struct pointer_motion_record rec = m_recent_motion[slot];
+    m_recent_motion_tail++;
+    /* Mirror the push-side count: a slot with non-zero deltas was a
+     * pointer-with-motion send, so the radio is done with one more
+     * in-flight pointer payload. */
+    if ((rec.dx | rec.dy | rec.scroll_x | rec.scroll_y) &&
+        m_pointer_inflight_count > 0) {
+        m_pointer_inflight_count--;
+    }
+    if (failed && (rec.dx | rec.dy | rec.scroll_x | rec.scroll_y)) {
+        m_motion_refund.dx       += rec.dx;
+        m_motion_refund.dy       += rec.dy;
+        m_motion_refund.scroll_x += rec.scroll_x;
+        m_motion_refund.scroll_y += rec.scroll_y;
+        if (m_motion_refund.stamp_ms == 0) {
+            const uint32_t now = k_uptime_get_32();
+            m_motion_refund.stamp_ms = (now == 0) ? 1 : now;
+        }
+    }
+    if (rec.overrode) {
+        restore_retransmit_count();
+    }
+}
+
+/* Drop every packet still sitting in ESB's TX FIFO and resync all of the
+ * per-send bookkeeping that lives in lockstep with TX events.
+ *
+ * esb_flush_tx() never fires the matching TX_SUCCESS / TX_FAILED for the
+ * packets it drops, so the ring tails (noack, critical-override, motion)
+ * stay behind their head, m_pointer_inflight_count stays inflated, and
+ * any per-send retransmit_count override that a flushed packet had
+ * applied is never restored — the radio would silently keep using the
+ * override for every subsequent send. Every caller that flushes queued
+ * traffic must therefore go through this wrapper so the next TX event
+ * pops the right slot and the radio is back at the steady-state count.
+ *
+ * The motion refund pool is intentionally preserved: it represents
+ * already-failed deltas that the next mouse send legitimately wants to
+ * pick up. set_channel wipes it explicitly afterwards because cross-
+ * channel motion is stale by the time the new channel is live.
+ */
+static void esb_flush_tx_and_reset(void) {
+    esb_flush_tx();
+#if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_HOP)
+    m_recent_noack_tail = m_recent_noack_head;
 #endif
+#if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_CRITICAL_MAX_RETRANSMIT)
+    m_recent_critical_tail = m_recent_critical_head;
+#endif
+    m_recent_motion_tail = m_recent_motion_head;
+    m_pointer_inflight_count = 0;
+    restore_retransmit_count();
+}
+
+void esb_transport_flush_tx(void) {
+    /* Don't yank the FIFO mid-burst. Wait until the radio has been
+     * silent (no TX event) for FLUSH_QUIET_MS, or FLUSH_FORCE_MS total —
+     * whichever comes first — so a packet that was about to ack gets the
+     * chance to complete normally instead of being dropped. The wait is
+     * bounded and the only callers (send_idle_packet, future external
+     * flushers) run on the system workqueue where k_sleep is fine; ISR-
+     * context flushers in this file go straight through the helper. */
+#if CONFIG_ZMK_ESB_ENDPOINT_FLUSH_QUIET_MS > 0
+    const uint32_t start = k_uptime_get_32();
+    while (true) {
+        const uint32_t now = k_uptime_get_32();
+        const uint32_t since_evt = (m_last_tx_event_ms == 0)
+            ? UINT32_MAX
+            : (uint32_t)(now - m_last_tx_event_ms);
+        if (since_evt >= CONFIG_ZMK_ESB_ENDPOINT_FLUSH_QUIET_MS) {
+            break;
+        }
+        if ((uint32_t)(now - start) >= CONFIG_ZMK_ESB_ENDPOINT_FLUSH_FORCE_MS) {
+            LOG_DBG("flush_tx: forcing after %u ms (no quiet window)",
+                    (uint32_t)(now - start));
+            break;
+        }
+        k_sleep(K_MSEC(1));
+    }
+#endif
+    esb_flush_tx_and_reset();
+}
 
 static void zmk_esb_transport_evt_cb(struct esb_evt const *event) {
+    if (event->evt_id == ESB_EVENT_TX_SUCCESS ||
+        event->evt_id == ESB_EVENT_TX_FAILED) {
+        const uint32_t now = k_uptime_get_32();
+        m_last_tx_event_ms = (now == 0) ? 1 : now;
+    }
     switch (event->evt_id) {
     case ESB_EVENT_TX_SUCCESS:
 #if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_RENDEZVOUS)
@@ -505,6 +781,7 @@ static void zmk_esb_transport_evt_cb(struct esb_evt const *event) {
             restore_retransmit_count();
         }
 #endif
+        motion_ring_consume(false);
         break;
 
     case ESB_EVENT_TX_FAILED:
@@ -517,7 +794,7 @@ static void zmk_esb_transport_evt_cb(struct esb_evt const *event) {
             m_sync_tx_result_success = false;
             m_sync_tx_in_progress = false;
             k_sem_give(&m_sync_tx_done);
-            esb_flush_tx();
+            esb_flush_tx_and_reset();
             break;
         }
 #endif
@@ -615,7 +892,8 @@ static void zmk_esb_transport_evt_cb(struct esb_evt const *event) {
             restore_retransmit_count();
         }
 #endif
-        esb_flush_tx();
+        motion_ring_consume(true);
+        esb_flush_tx_and_reset();
         break;
 
     case ESB_EVENT_RX_RECEIVED:
@@ -736,8 +1014,12 @@ int esb_transport_set_channel(const uint8_t channel) {
     z_nrf_clock_calibration_force_start();
 
     /* Drain any queued packets on the old channel — retransmits on the new
-     * channel would arrive at a dongle that has not yet hopped. */
-    esb_flush_tx();
+     * channel would arrive at a dongle that has not yet hopped. The helper
+     * also drains the noack/critical/motion rings, zeroes the inflight
+     * pointer count, and restores the radio's retransmit_count, so any
+     * critical- or pointer-override packet that got dropped by the flush
+     * does not strand the radio at the override value. */
+    esb_flush_tx_and_reset();
     const int err = esb_set_rf_channel(channel);
     if (err) {
         return err;
@@ -763,18 +1045,18 @@ int esb_transport_set_channel(const uint8_t channel) {
 #if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_COOP_HOP)
     m_link_degraded_armed = false;
 #endif
-    /* Drain the noack ring too — any in-flight pre-hop sends produced
-     * push entries we'll never see TX events for (esb_flush_tx above).
-     * Restarting tail at head keeps consume_recent_noack happy. */
-    m_recent_noack_tail = m_recent_noack_head;
-#if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_CRITICAL_MAX_RETRANSMIT)
-    /* Same drain for the override ring. After a flushed hop, force the
-     * radio back to the non-override count so HID resumed on the new
-     * channel doesn't sit at the elevated retransmit count waiting for
-     * an event that will never come. */
-    m_recent_critical_tail = m_recent_critical_head;
-    restore_retransmit_count();
-#endif
+    /* Cross-channel motion is stale by the time the new channel is live
+     * (post-quiet window + dongle catch-up), so additionally drop any
+     * pending pointer refund — adding it to the next mouse report would
+     * teleport the cursor. Matches the input processor's accumulator
+     * clear at the same moment. The motion ring tail and inflight count
+     * are already wiped by esb_flush_tx_and_reset above; only the refund
+     * pool is unique to the channel-change path. */
+    m_motion_refund.dx = 0;
+    m_motion_refund.dy = 0;
+    m_motion_refund.scroll_x = 0;
+    m_motion_refund.scroll_y = 0;
+    m_motion_refund.stamp_ms = 0;
     /* Arm the post-hop quiet window. Any send() during this interval is
      * silently dropped — the dongle may still be on the old channel and
      * anything we transmit would just fail and feed the next hop trigger.
@@ -831,6 +1113,11 @@ bool esb_transport_is_quiet(void) {
     return false;
 }
 
+bool esb_transport_pointer_backpressure(void) {
+    return m_pointer_inflight_count >=
+        CONFIG_ZMK_ESB_ENDPOINT_POINTER_INFLIGHT_CAP;
+}
+
 void esb_transport_get_per_stats(uint32_t *ok_out, uint32_t *retried_out,
                                  uint32_t *exhausted_out) {
     if (ok_out) {
@@ -841,6 +1128,21 @@ void esb_transport_get_per_stats(uint32_t *ok_out, uint32_t *retried_out,
     }
     if (exhausted_out) {
         *exhausted_out = tx_exhausted_count;
+    }
+}
+
+void esb_transport_get_hid_tx_stats(uint32_t *count_out, uint16_t *rate_hz_out) {
+    if (count_out) {
+        *count_out = m_hid_tx_count;
+    }
+    if (rate_hz_out) {
+        const uint32_t now = k_uptime_get_32();
+        if (m_hid_tx_bucket_ms == 0 ||
+            (uint32_t)(now - m_hid_tx_bucket_ms) > HID_RATE_STALE_MS) {
+            *rate_hz_out = 0;
+        } else {
+            *rate_hz_out = m_hid_tx_rate_hz;
+        }
     }
 }
 
@@ -929,7 +1231,7 @@ int esb_transport_send(const uint8_t pipe, const uint8_t *data, uint8_t len) {
     const bool is_shell = (len >= 1) &&
         (data[0] == ESB_PKT_SHELL_DATA || data[0] == ESB_PKT_SHELL_POLL || data[0] == ESB_PKT_SHELL_STOP);
     if (!is_shell && esb_tx_full()) {
-        esb_flush_tx();
+        esb_flush_tx_and_reset();
     }
 
 #if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_HOP)
@@ -948,6 +1250,20 @@ int esb_transport_send(const uint8_t pipe, const uint8_t *data, uint8_t len) {
     const bool is_bg_poll = (len >= 1) && (data[0] == ESB_PKT_SHELL_BG_POLL);
     if (!is_bg_poll) {
         note_activity();
+    }
+
+    if (len >= 1 && data[0] == ESB_PKT_HID_REPORT) {
+        m_hid_tx_count++;
+        m_hid_tx_bucket_count++;
+        const uint32_t now = k_uptime_get_32();
+        if (m_hid_tx_bucket_ms == 0) {
+            m_hid_tx_bucket_ms = now;
+        } else if ((uint32_t)(now - m_hid_tx_bucket_ms) >= HID_RATE_BUCKET_MS) {
+            m_hid_tx_rate_hz = (m_hid_tx_bucket_count > UINT16_MAX)
+                ? UINT16_MAX : (uint16_t)m_hid_tx_bucket_count;
+            m_hid_tx_bucket_count = 0;
+            m_hid_tx_bucket_ms = now;
+        }
     }
 
 #if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_HOP)
@@ -998,6 +1314,37 @@ int esb_transport_send(const uint8_t pipe, const uint8_t *data, uint8_t len) {
     }
 #endif
 
+    /* Pointer/scroll handling: apply any pending refund (from a previous
+     * mouse motion TX_FAILED) to this packet's d_x/d_y/d_scroll_*
+     * saturating to int16, push the post-refund deltas to the motion
+     * ring so a TX_FAILED on this send can re-enter them, and lower the
+     * radio's retransmit_count for motion-only sends so failures land
+     * quickly and the refund pool stays current. Mouse reports that
+     * carry any button bit keep the global retransmit count — buttons
+     * are edge-triggered. Non-mouse sends still push a zero record so
+     * the ring head/tail stay aligned with the TX event stream. The
+     * pointer override is mutually exclusive with critical_override
+     * (no critical packet is a mouse report) so the order with the
+     * critical block above is moot. The override is also a no-op when
+     * the send is noack (HID_NOACK=y): noack TX events are not retried
+     * by the radio at all, but esb_set_retransmit_count is still cheap
+     * and the field stays consistent for the next ACKed send. */
+    bool pointer_override = false;
+    if (is_mouse_report(data, len)) {
+        struct esb_mouse_body *body = mouse_body_of(pkt.data);
+        motion_refund_apply(body);
+        const bool has_motion =
+            (body->d_x | body->d_y | body->d_scroll_x | body->d_scroll_y) != 0;
+        pointer_override = has_motion && (body->buttons == 0) && !noack;
+        if (pointer_override) {
+            (void)esb_set_retransmit_count(
+                CONFIG_ZMK_ESB_ENDPOINT_POINTER_RETRANSMIT_COUNT);
+        }
+        motion_ring_push(body, pointer_override);
+    } else {
+        motion_ring_push(NULL, false);
+    }
+
     return esb_write_payload(&pkt);
 }
 
@@ -1023,7 +1370,7 @@ int esb_transport_send_blocking(const uint8_t channel, const uint8_t pipe,
      * very next user-thread send (which we held off via m_sync_tx_in_progress
      * during the round trip). m_addr.channel is left untouched throughout —
      * we are visiting, not committing. */
-    esb_flush_tx();
+    esb_flush_tx_and_reset();
 
     const int chan_err = esb_set_rf_channel(channel);
     if (chan_err) {
@@ -1169,7 +1516,7 @@ void esb_transport_on_slot_start(void) {
      * the first EWMA sample arrives. */
     m_adaptive_retransmit_count = CONFIG_ZMK_ESB_ENDPOINT_RETRANSMIT_COUNT;
     k_work_reschedule(&m_adaptive_retry_work,
-                      K_MSEC(ADAPTIVE_RETRY_INTERVAL_MS));
+                      K_MSEC(CONFIG_ZMK_ESB_ENDPOINT_ADAPTIVE_RETRY_INTERVAL_MS));
 #endif
     LOG_DBG("ESB slot start OK (VTOR[RADIO]=0x%08x)",
             m_ram_vtor[16 + RADIO_IRQn]);

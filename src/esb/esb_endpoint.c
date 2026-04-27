@@ -273,6 +273,54 @@ static int cmd_esb_bench(const struct shell *sh, const size_t argc, char **argv)
 }
 #endif /* CONFIG_ZMK_ESB_ENDPOINT_BENCH */
 
+static const char *pairing_state_str(const pairing_state_t s) {
+    switch (s) {
+    case PAIRING_STATE_IDLE:      return "idle";
+    case PAIRING_STATE_UNPAIRED:  return "unpaired";
+    case PAIRING_STATE_PAIRING:   return "pairing";
+    case PAIRING_STATE_VERIFYING: return "verifying";
+    case PAIRING_STATE_CONNECTED: return "connected";
+    }
+    return "?";
+}
+
+static int cmd_esb_status(const struct shell *sh, const size_t argc, char **argv) {
+    ARG_UNUSED(argc);
+    ARG_UNUSED(argv);
+
+    shell_print(sh, "pairing:  %s", pairing_state_str(pairing_get_state()));
+    shell_print(sh, "active:   %s", zmk_esb_endpoint_is_active() ? "yes" : "no");
+
+#if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_HOP)
+    const uint8_t cur = esb_transport_get_channel();
+    const uint8_t nxt = channel_hop_ep_get_committed();
+    shell_print(sh, "channel:  %u (hop %s)",
+                cur, channel_hop_ep_is_active() ? "active" : "idle");
+    if (nxt == CHANNEL_HOP_INVALID) {
+        shell_print(sh, "next:     <none>");
+    } else {
+        shell_print(sh, "next:     %u", nxt);
+    }
+#else
+    shell_print(sh, "channel:  %u", esb_transport_get_channel());
+#endif
+
+    int8_t r_last, r_ewma;
+    if (esb_transport_get_peer_rssi(&r_last, &r_ewma)) {
+        shell_print(sh, "rssi:     last=%d ewma=%d (dBm, peer)",
+                    (int)r_last, (int)r_ewma);
+    } else {
+        shell_print(sh, "rssi:     n/a");
+    }
+
+    uint32_t hid_total = 0;
+    uint16_t hid_rate  = 0;
+    esb_transport_get_hid_tx_stats(&hid_total, &hid_rate);
+    shell_print(sh, "HID:      %u Hz (total %u)",
+                (unsigned)hid_rate, (unsigned)hid_total);
+    return 0;
+}
+
 #if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_HOP)
 static int cmd_esb_channel(const struct shell *sh, const size_t argc, char **argv) {
     ARG_UNUSED(argc);
@@ -307,6 +355,7 @@ static int cmd_esb_channel(const struct shell *sh, const size_t argc, char **arg
 
 SHELL_STATIC_SUBCMD_SET_CREATE(esb_cmds,
     SHELL_CMD(unpair, NULL, "Forget paired dongle and start beaconing", cmd_esb_unpair),
+    SHELL_CMD(status, NULL, "Show pairing, channel, RSSI and HID rate", cmd_esb_status),
 #if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_BENCH)
     SHELL_CMD(bench, NULL, "Run ESB link benchmark (run twice: start, then read results)", cmd_esb_bench),
 #endif

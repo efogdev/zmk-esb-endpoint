@@ -10,6 +10,7 @@
 #include "esb_transport.h"
 
 #include <zephyr/logging/log.h>
+
 LOG_MODULE_REGISTER(zmk_esb_chhop_ep, CONFIG_ZMK_ESB_ENDPOINT_LOG_LEVEL);
 
 #if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_HOP)
@@ -82,14 +83,16 @@ static struct k_work           hop_work;
 
 static uint8_t m_post_hop_burst_remaining;
 
-/* Candidate locked in at start_post_hop_burst() so every tick of the
- * burst proposes the SAME channel until a CONFIRM populates
- * m_committed_next. Without this, each tick falls through to
- * pick_candidate() (which is randomised) and the dongle's
- * commit-on-every-PROPOSAL semantics make committed_next oscillate
- * across the burst — observed live as 16/93/16 across three ticks.
- * Reset to INVALID when the burst ends. */
-static uint8_t m_post_hop_burst_candidate = CHANNEL_HOP_INVALID;
+/* Sticky candidate for the post-hop burst: the channel post_hop_burst_work_fn
+ * proposes on every tick until a CONFIRM lands. pick_candidate() is
+ * randomised, so without a sticky value each tick would propose a
+ * different channel and the dongle's commit-on-every-PROPOSAL semantics
+ * would make committed_next oscillate across the burst window — observed
+ * live as 16/93/16 across three ticks. Reset at start_post_hop_burst() and
+ * at burst completion. negotiate_work_fn deliberately bypasses this cache:
+ * it retries on its own cadence outside the burst, and a dead first pick
+ * sticky across retries would freeze recovery on one bad channel. */
+static uint8_t m_pending_candidate = CHANNEL_HOP_INVALID;
 
 /* Counter of PROPOSAL attempts left in the current REQUEST-driven burst.
  * The dongle queues an ESB_PKT_CHANNEL_HOP_REQUEST whenever its
@@ -121,17 +124,18 @@ static uint32_t m_hop_cooldown_until;
  * occurred for RENDEZVOUS_FALLBACK_MS, the link is dead long enough to
  * justify bypassing the cooldown and forcing a rendezvous hop.
  *
- * Earlier revisions zeroed this on TX_SUCCESS. That made one lucky packet
- * inside the cooldown window permanently disable fallback for the rest
- * of the cooldown — even if the link went dead immediately afterwards.
- * With two such success→silence cycles back-to-back the endpoint could
- * sit without firing any hop for roughly twice CHANNEL_HOP_COOLDOWN_MS.
- * Refreshing to now on TX_SUCCESS keeps the "no activity for
- * RENDEZVOUS_FALLBACK_MS" invariant correct across intermittent links.
+ * TX_SUCCESS refreshes this to now (rather than zeroing it). Zeroing on
+ * TX_SUCCESS would let one lucky packet inside the cooldown window
+ * permanently disable fallback for the rest of that cooldown — even if
+ * the link went dead immediately afterwards — and two such
+ * success→silence cycles back-to-back could keep the endpoint from
+ * firing any hop for roughly twice CHANNEL_HOP_COOLDOWN_MS. Refreshing
+ * keeps the "no activity for RENDEZVOUS_FALLBACK_MS" invariant correct
+ * across intermittent links.
  *
- * Zero still means "no hop has ever committed" — set only by init /
- * disconnect and preserved as the fallback's "is there anything to fall
- * back on?" gate. 32-bit wrap-safe compare. */
+ * Zero means "no hop has ever committed" — set only by init / disconnect
+ * and preserved as the fallback's "is there anything to fall back on?"
+ * gate. 32-bit wrap-safe compare. */
 static volatile uint32_t m_last_link_event_ms;
 
 #if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_RENDEZVOUS)
@@ -208,6 +212,23 @@ static uint8_t pick_candidate(void) {
                             current);
 }
 
+/* Reuse the cached pending candidate if it is still a valid target;
+ * otherwise pick fresh and cache. Used only by post_hop_burst_work_fn so
+ * its consecutive ticks converge on one channel within a single burst
+ * window. negotiate_work_fn calls pick_candidate() directly so its own
+ * retries diversify across channels — a sticky bad pick there would
+ * lock recovery on a dead channel for the lifetime of the negotiation. */
+static uint8_t select_pending_candidate(void) {
+    const uint8_t current = esb_transport_get_channel();
+    if (m_pending_candidate != CHANNEL_HOP_INVALID &&
+        m_pending_candidate != current &&
+        !quarantine_is(&m_quarantine, m_pending_candidate)) {
+        return m_pending_candidate;
+    }
+    m_pending_candidate = pick_candidate();
+    return m_pending_candidate;
+}
+
 static void send_proposal(uint8_t candidate) {
     struct esb_pkt_channel_hop_proposal pkt = {
         .type     = ESB_PKT_CHANNEL_HOP_PROPOSAL,
@@ -252,8 +273,11 @@ static void negotiate_work_fn(struct k_work *w) {
         quarantine_is(&m_quarantine, m_committed_next) ||
         m_committed_next == esb_transport_get_channel()) {
         needs_commit = true;
-        /* Fresh candidate — until CONFIRM lands, the dongle will hold
-         * a different value than we hold here. */
+        /* Fresh random candidate per tick — until CONFIRM lands the dongle
+         * holds a different value than we hold here, so retries must
+         * diversify. Sharing post_hop_burst_work_fn's sticky cache here
+         * would let one dead first pick freeze negotiation on a bad
+         * channel for the rest of the recovery cycle. */
         m_committed_synced = false;
         const uint8_t candidate = pick_candidate();
         if (candidate != CHANNEL_HOP_INVALID) {
@@ -298,22 +322,19 @@ static void idle_check_work_fn(struct k_work *w) {
 }
 
 static void send_idle_packet(void) {
+    /* Drop any queued user traffic so the IDLE goes out cleanly without
+     * a tail of stale HID frames riding behind it. Use the wrapper, not
+     * bare esb_flush_tx — the dropped packets' ring slots and any per-
+     * send retransmit_count override they applied still need to be
+     * reset, otherwise the IDLE's own TX event pops a stale slot and
+     * the radio can stay stuck at an override count for the next
+     * sends. */
+    esb_transport_flush_tx();
+
     struct esb_pkt_idle pkt = { .type = ESB_PKT_IDLE };
-    /* IDLE is the dongle's sole signal to disarm its silence watchdog
-     * (see channel_hop_dongle.c::channel_hop_dongle_note_rx_idle). A
-     * single dropped IDLE leaves the dongle thinking the peer is still
-     * active, fires silence_work after RX_SILENCE_MS, triggers a
-     * speculative hop into a stale committed_next, and cascades into
-     * rollback dwell — a multi-second blackout from a single 1-byte
-     * packet loss. Burst three back-to-back: ESB queues all three into
-     * the TX FIFO and the radio drains them in <1 ms at 2 Mbps, so
-     * total link-loss probability drops by ~3 orders of magnitude with
-     * negligible cost. */
-    for (int i = 0; i < 3; i++) {
-        const int err = esb_transport_send(ESB_PIPE_DATA, (uint8_t *)&pkt, sizeof(pkt));
-        if (err) {
-            LOG_DBG("IDLE send %d failed: %d", i, err);
-        }
+    const int err = esb_transport_send(ESB_PIPE_DATA, (uint8_t *)&pkt, sizeof(pkt));
+    if (err) {
+        LOG_DBG("IDLE send failed: %d", err);
     }
 }
 
@@ -390,19 +411,11 @@ static void post_hop_burst_work_fn(struct k_work *w) {
         !quarantine_is(&m_quarantine, m_committed_next)) {
         /* CONFIRM-derived ground truth — both sides agree on this. */
         candidate = m_committed_next;
-    } else if (m_post_hop_burst_candidate != CHANNEL_HOP_INVALID &&
-               m_post_hop_burst_candidate != current &&
-               !quarantine_is(&m_quarantine, m_post_hop_burst_candidate)) {
-        /* No CONFIRM yet, but burst already picked a candidate — stick
-         * to it. Drives all dongle commits to the same channel until
-         * one CONFIRM gets through, after which the branch above takes
-         * over. Re-validates against quarantine each tick in case a
-         * coop hop quarantined the burst's pick mid-burst. */
-        candidate = m_post_hop_burst_candidate;
     } else {
-        candidate = pick_candidate();
-        /* Cache for subsequent ticks of this burst. */
-        m_post_hop_burst_candidate = candidate;
+        /* No CONFIRM yet — go through the shared cache so this tick and
+         * any negotiate_work tick that fires alongside us propose the
+         * same channel. Quarantine is re-validated inside the helper. */
+        candidate = select_pending_candidate();
     }
 
 #if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_RENDEZVOUS)
@@ -457,7 +470,7 @@ static void post_hop_burst_work_fn(struct k_work *w) {
         /* Burst done — clear the sticky candidate so the next burst
          * picks fresh (the link state may have changed since this burst
          * started). */
-        m_post_hop_burst_candidate = CHANNEL_HOP_INVALID;
+        m_pending_candidate = CHANNEL_HOP_INVALID;
         /* If the device went idle during the burst, the trailing
          * PROPOSALs we just sent flipped the dongle back to
          * peer_idle=false (every non-IDLE packet does), re-arming its
@@ -480,7 +493,7 @@ static void start_post_hop_burst(void) {
     m_post_hop_burst_remaining = CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_HOP_POST_BURST_COUNT;
     /* Fresh burst — clear any leftover sticky candidate from a prior
      * burst that ended early or was preempted. */
-    m_post_hop_burst_candidate = CHANNEL_HOP_INVALID;
+    m_pending_candidate = CHANNEL_HOP_INVALID;
     /* First PROPOSAL lands after the transport's quiet window expires —
      * esb_transport_send silently drops anything sent before then. */
     k_work_reschedule(&post_hop_burst_work,
@@ -691,8 +704,7 @@ static void hop_work_fn(struct k_work *w) {
             current, target, current,
             (unsigned)CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_QUARANTINE_MS);
 
-    commit_hop_bookkeeping(current,
-                           CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_QUARANTINE_MS);
+    commit_hop_bookkeeping(current, CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_QUARANTINE_MS);
 }
 
 /* ----- Cooperative-hop handshake ----- */

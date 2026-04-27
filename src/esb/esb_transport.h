@@ -43,6 +43,22 @@ uint8_t esb_transport_get_rendezvous_channel(void);
  * the ESB slot is active; no-op with error if inactive. */
 int esb_transport_set_channel(uint8_t channel);
 
+/* Drop every packet still sitting in ESB's TX FIFO and resync all of the
+ * per-send bookkeeping (noack ring, critical-override ring, motion ring,
+ * in-flight pointer count, per-send retransmit_count override). Use this
+ * instead of the bare esb_flush_tx() — flushing without resetting the
+ * rings mis-attributes the next TX events to the now-dropped packets and
+ * can leave the radio's retransmit_count stuck at an override value. The
+ * motion refund pool is left intact; cross-channel staleness is the
+ * caller's concern (set_channel handles it explicitly).
+ *
+ * Blocks the caller until the radio has been silent for FLUSH_QUIET_MS,
+ * or up to FLUSH_FORCE_MS total before forcing the drop, so an in-flight
+ * TX cycle has a chance to complete instead of being yanked. May only be
+ * called from a context where k_sleep is allowed (system workqueue,
+ * thread); ISR-context flushers in the transport bypass this wrapper. */
+void esb_transport_flush_tx(void);
+
 /* Send one packet on `channel` (without changing the active channel) and
  * block until the ESB radio reports TX_SUCCESS, TX_FAILED, or `timeout`
  * elapses. Used for rendezvous side-trips during the post-hop burst.
@@ -87,6 +103,18 @@ int esb_transport_get_link_quality(uint8_t *retried_out, uint16_t *ewma_x10_out)
  * preserving the accumulated delta for the next emission. */
 bool esb_transport_is_quiet(void);
 
+/* True when too many pointer-motion HID reports are in-flight (queued in
+ * ESB's TX FIFO awaiting send/ack). Independent from is_quiet(): this is
+ * back-pressure rather than a hard drop, and only the mouse input
+ * processor checks it so non-pointer traffic (keyboard, consumer, shell)
+ * keeps flowing while pointer reports cap out. The input processor
+ * back-pressures by accumulating deltas in its own pre-send pool until
+ * a TX event opens an in-flight slot — preventing the FIFO from
+ * buffering a backlog of stale pointer frames that would otherwise
+ * squirt out as a cursor teleport when the link recovers. The cap is
+ * CONFIG_ZMK_ESB_ENDPOINT_POINTER_INFLIGHT_CAP. */
+bool esb_transport_pointer_backpressure(void);
+
 /* Handle an inbound ESB_PKT_LINK_STATS payload. Called from pairing.c's
  * RX dispatch. Silently drops too-short frames. */
 void esb_transport_on_rx_link_stats(const uint8_t *data, uint8_t len);
@@ -104,6 +132,13 @@ bool esb_transport_get_peer_rssi(int8_t *last_out, int8_t *ewma_out);
  * PER over any interval ≈ delta(exhausted) / (delta(ok) + delta(exhausted)). */
 void esb_transport_get_per_stats(uint32_t *ok_out, uint32_t *retried_out,
                                  uint32_t *exhausted_out);
+
+/* HID-report TX rate observability. count_out gets the cumulative number
+ * of ESB_PKT_HID_REPORT sends since boot. rate_hz_out gets the count
+ * over the most recently completed one-second bucket, or 0 once the
+ * bucket has been idle long enough to be considered stale. Either
+ * pointer may be NULL. */
+void esb_transport_get_hid_tx_stats(uint32_t *count_out, uint16_t *rate_hz_out);
 
 void esb_transport_on_slot_start(void);
 void esb_transport_on_slot_stop(void);

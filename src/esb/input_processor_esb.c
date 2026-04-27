@@ -96,27 +96,45 @@ static void retry_work_fn(struct k_work *work) {
     struct k_work_delayable *dw = k_work_delayable_from_work(work);
     struct esb_ip_data *d = CONTAINER_OF(dw, struct esb_ip_data, retry_work);
 
-    if (esb_transport_is_quiet()) {
+    if (esb_transport_is_quiet() || esb_transport_pointer_backpressure()) {
         k_work_reschedule(&d->retry_work, K_MSEC(ESB_IP_QUIET_RETRY_MS));
         return;
     }
     drain_pending_buttons(d);
 
-    /* Motion that accumulated during the quiet window is stale by
-     * definition: by the time the host sees it, it describes where the
-     * cursor was during the stall. Clearing the accumulator here also
-     * resets accum_start_ms so fresh post-quiet motion is not silently
-     * dropped by the stale-motion check off the old timestamp. */
-    d->dx = d->dy = d->scroll_x = d->scroll_y = 0;
-    d->accum_start_ms = 0;
+    /* Flush any motion that accumulated during the deferral window as a
+     * final report before clearing the accumulator. Two cases:
+     *  - Brief pointer back-pressure (inflight cap): motion is fresh and
+     *    should land on the host so the user's deltas aren't dropped.
+     *  - Long quiet window (post-hop quiet, sync-TX side-trip): motion
+     *    is stale by the time the host would see it.
+     * The MOTION_MAX_STALE_MS check distinguishes them — fresh motion
+     * flushes; older motion is dropped to avoid teleporting the cursor.
+     * Buttons drained above already inform the host of any edge. */
+    if (d->accum_start_ms != 0) {
+        const uint32_t age = k_uptime_get_32() - d->accum_start_ms;
+        if (age <= ESB_IP_MOTION_MAX_STALE_MS &&
+            (d->dx | d->dy | d->scroll_x | d->scroll_y)) {
+            send_hid_report_raw(d->buttons, d->dx, d->dy,
+                                d->scroll_x, d->scroll_y);
+        }
+        d->dx = d->dy = d->scroll_x = d->scroll_y = 0;
+        d->accum_start_ms = 0;
+    }
 }
 
 static void send_mouse_report(struct esb_ip_data *d, bool button_changed) {
-    /* Quiet window (post-hop quiet, sync-TX side-trip): the transport
-     * silently drops anything we hand it. Coalesce motion in the
-     * accumulator and queue button edges so the host eventually sees
-     * each press/release in order — sending now would lose them. */
-    if (esb_transport_is_quiet()) {
+    /* Defer the send when either:
+     *  - the transport is quiet (post-hop quiet, sync-TX side-trip): it
+     *    will silently drop whatever we hand it, or
+     *  - too many pointer-motion reports are already in-flight in ESB's
+     *    TX FIFO: queueing more would only buffer stale frames that
+     *    later squirt out as a cursor teleport when the link recovers.
+     * In both cases motion coalesces in the per-instance accumulator
+     * and button edges queue so the host eventually sees each
+     * press/release in order — sending now would lose them. The retry
+     * worker drains the queue once the deferral condition clears. */
+    if (esb_transport_is_quiet() || esb_transport_pointer_backpressure()) {
         if (button_changed) {
             enqueue_pending_button(d);
             k_work_reschedule(&d->retry_work, K_MSEC(ESB_IP_QUIET_RETRY_MS));
