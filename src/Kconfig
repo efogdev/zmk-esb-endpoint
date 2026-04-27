@@ -634,7 +634,7 @@ config ZMK_ESB_ENDPOINT_CHANNEL_HOP_RENDEZVOUS_TIMEOUT_MS
 
 config ZMK_ESB_ENDPOINT_CHANNEL_HOP_RENDEZVOUS_FALLBACK_MS
     int "Force a rendezvous-channel hop after this many ms of post-hop TX failure"
-    default 450
+    default 550
     range 0 10000
     help
       If TX continues to fail for this long after a hop committed (i.e.
@@ -655,7 +655,7 @@ config ZMK_ESB_ENDPOINT_CHANNEL_HOP_RENDEZVOUS_FALLBACK_MS
 
 config ZMK_ESB_ENDPOINT_CHANNEL_HOP_COOLDOWN_MS
     int "Minimum dwell on the new channel before another hop can fire (ms)"
-    default 500
+    default 850
     range 0 10000
     help
       After a successful channel hop, TX-failure-triggered hops are
