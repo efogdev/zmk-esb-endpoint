@@ -248,9 +248,13 @@ static uint32_t m_tx_quiet_until_ms;
  * carrying traffic. Reset by esb_transport_set_channel() — a hop wipes
  * link history.
  *
- * m_link_quality_ewma_x10 is the EWMA of tx_attempts itself (×10 for
- * fixed-point), exposed via esb_transport_get_link_quality() purely
- * for shell/observability. Updated at the same time as the popcount.
+ * m_link_quality_ewma_x10 is the EWMA of tx_attempts on the
+ * TX_SUCCESS path only (×10 for fixed-point), exposed via
+ * esb_transport_get_link_quality() for shell/observability and
+ * adaptive_retry. TX_FAILED still flips the popcount bit so coop-hop
+ * sees retry exhaustion, but does not feed the EWMA — its
+ * retransmit_count+1 sample is bounded by the radio ceiling rather
+ * than the real delivery cost and would dominate the average.
  *
  * m_recent_noack[] tracks the noack flag of the last 8 sends in arrival
  * order, indexed by m_recent_noack_head (low 3 bits). Each TX event
@@ -386,11 +390,11 @@ static bool consume_recent_noack(void) {
     return was_noack;
 }
 
-/* Shift one bit into the link-quality window, maintain the cached
- * popcount, update the EWMA. Called from the RADIO ISR. Single-word
- * Cortex-M reads/writes on the state vars are atomic; the shell
- * accessor takes a snapshot rather than locking. */
-static void link_quality_record(uint8_t tx_attempts, bool retry_bit) {
+/* Shift one bit into the link-quality window and maintain the cached
+ * popcount. Called from the RADIO ISR. Single-word Cortex-M reads/
+ * writes on the state vars are atomic; the shell accessor takes a
+ * snapshot rather than locking. */
+static void link_quality_shift_window(const bool retry_bit) {
     const uint32_t old_window = m_link_quality_window;
     const uint32_t mask = (CONFIG_ZMK_ESB_ENDPOINT_LINK_QUALITY_WINDOW < 32)
         ? ((1u << CONFIG_ZMK_ESB_ENDPOINT_LINK_QUALITY_WINDOW) - 1u)
@@ -409,10 +413,18 @@ static void link_quality_record(uint8_t tx_attempts, bool retry_bit) {
     } else if (!retry_bit && dropped_bit) {
         m_link_quality_count--;
     }
+}
+
+/* TX_SUCCESS variant: shift the popcount window AND update the
+ * tx_attempts EWMA. The TX_FAILED path uses link_quality_shift_window()
+ * directly because retry-exhausted tx_attempts (retransmit_count+1)
+ * is bounded by the radio's ceiling, not by actual delivery cost, and
+ * would dominate the EWMA out of its nominal range. */
+static void link_quality_record(const uint8_t tx_attempts, const bool retry_bit) {
+    link_quality_shift_window(retry_bit);
 
     /* EWMA × 10 of attempts: ewma' = (ewma * 7 + attempts*10) / 8.
-     * Saturating to retransmit_count+1 in case of noise. Initialized
-     * to 10 (== 1.0 attempts) in init / set_channel. */
+     * Initialized to 10 (== 1.0 attempts) in init / set_channel. */
     const uint16_t a10 = (uint16_t)tx_attempts * 10u;
     m_link_quality_ewma_x10 =
         (uint16_t)(((uint32_t)m_link_quality_ewma_x10 * 7u + a10) / 8u);
@@ -784,6 +796,17 @@ static void zmk_esb_transport_evt_cb(struct esb_evt const *event) {
         motion_ring_consume(false);
         break;
 
+
+    case ESB_EVENT_RX_RECEIVED:
+        while (esb_read_rx_payload(&m_rx_payload) == 0) {
+            if (m_rx_payload.length > 0 &&
+                m_rx_payload.length <= ESB_MAX_PAYLOAD_LEN) {
+                rx_len = m_rx_payload.length;
+                memcpy(rx_buf, m_rx_payload.data, rx_len);
+                k_work_submit(&rx_work);
+            }
+        }
+        break;
     case ESB_EVENT_TX_FAILED:
 #if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_RENDEZVOUS)
         if (m_sync_tx_in_progress) {
@@ -861,7 +884,7 @@ static void zmk_esb_transport_evt_cb(struct esb_evt const *event) {
          * hop actually fixed the link. */
         if (m_last_tx_success_ms != 0) {
             const uint32_t since_ok =
-                k_uptime_get_32() - m_last_tx_success_ms;
+                    k_uptime_get_32() - m_last_tx_success_ms;
             if (since_ok >= CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_HOP_WEAK_LINK_MS) {
                 channel_hop_ep_on_tx_fail_isr();
                 const uint32_t now_w = k_uptime_get_32();
@@ -869,15 +892,17 @@ static void zmk_esb_transport_evt_cb(struct esb_evt const *event) {
             }
         }
 #endif
-        /* TX_FAILED also feeds the link-quality metric: definite retry
-         * exhaustion is a stronger "1" than a single retransmit. We
-         * still consume the noack slot to keep ring head/tail in sync,
-         * but unconditionally count it as retried — the existing
-         * TX-fail trigger is the real escalation path here, the
-         * metric just keeps coop-hop's view of "how bad is it" honest. */
+        /* TX_FAILED feeds only the popcount window, not the EWMA:
+         * definite retry exhaustion is a stronger "1" than a single
+         * retransmit and keeps coop-hop's "how bad is it" view honest,
+         * but the EWMA is the avg-tx_attempts-on-delivered-packets
+         * signal that drives adaptive_retry, and a retransmit_count+1
+         * spike would dominate it. The TX-fail trigger remains the real
+         * escalation path. We still consume the noack slot to keep ring
+         * head/tail in sync. */
         {
             (void)consume_recent_noack();
-            link_quality_record((uint8_t)event->tx_attempts, true);
+            link_quality_shift_window(true);
             /* Don't fire the coop-hop trigger from the fail branch:
              * TX-fail-window / weak-link triggers already own the
              * "really bad" path, and double-firing would race a
@@ -893,18 +918,10 @@ static void zmk_esb_transport_evt_cb(struct esb_evt const *event) {
         }
 #endif
         motion_ring_consume(true);
-        esb_flush_tx_and_reset();
-        break;
-
-    case ESB_EVENT_RX_RECEIVED:
-        while (esb_read_rx_payload(&m_rx_payload) == 0) {
-            if (m_rx_payload.length > 0 &&
-                m_rx_payload.length <= ESB_MAX_PAYLOAD_LEN) {
-                rx_len = m_rx_payload.length;
-                memcpy(rx_buf, m_rx_payload.data, rx_len);
-                k_work_submit(&rx_work);
-            }
+        if (esb_tx_full()) {
+            esb_flush_tx_and_reset();
         }
+
         break;
     }
 }
@@ -913,7 +930,7 @@ static int esb_init_and_configure(void) {
     struct esb_config cfg = ESB_DEFAULT_CONFIG;
     cfg.protocol           = ESB_PROTOCOL_ESB_DPL;
     cfg.mode               = ESB_MODE_PTX;
-    cfg.bitrate            = ESB_BITRATE_2MBPS_BLE;
+    cfg.bitrate            = ESB_BITRATE_1MBPS_BLE;
     cfg.crc                = ESB_CRC_16BIT;
     cfg.retransmit_count   = CONFIG_ZMK_ESB_ENDPOINT_RETRANSMIT_COUNT;
     cfg.retransmit_delay   = CONFIG_ZMK_ESB_ENDPOINT_RETRANSMIT_DELAY_US;
@@ -1230,7 +1247,22 @@ int esb_transport_send(const uint8_t pipe, const uint8_t *data, uint8_t len) {
 
     const bool is_shell = (len >= 1) &&
         (data[0] == ESB_PKT_SHELL_DATA || data[0] == ESB_PKT_SHELL_POLL || data[0] == ESB_PKT_SHELL_STOP);
-    if (!is_shell && esb_tx_full()) {
+    /* Fail fast before any ring/refund bookkeeping when the FIFO is full
+     * and this is a shell send. The non-shell path flushes (which resets
+     * the rings), so esb_write_payload below always succeeds. The shell
+     * path intentionally does not flush — flushing would drop pending
+     * pointer reports and other queued shell bytes. Pushing to the
+     * noack/critical/motion rings and then losing the packet to -ENOMEM
+     * leaks a phantom zero slot in each ring; the next real-pointer
+     * TX event then consumes the phantom and the real pointer record
+     * stays stranded, never decrementing m_pointer_inflight_count.
+     * Returning early before the pushes keeps head/tail in lockstep
+     * with TX events; the shell relay drain loop already handles
+     * -ENOMEM by re-queueing the unsent bytes. */
+    if (esb_tx_full()) {
+        if (is_shell) {
+            return -ENOMEM;
+        }
         esb_flush_tx_and_reset();
     }
 

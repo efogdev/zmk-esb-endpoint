@@ -52,7 +52,7 @@ config ZMK_ESB_ENDPOINT_ADAPTIVE_RETRY
 config ZMK_ESB_ENDPOINT_ADAPTIVE_RETRY_INTERVAL_MS
     int "Adaptive retry: re-evaluation interval (ms)"
     depends on ZMK_ESB_ENDPOINT_ADAPTIVE_RETRY
-    default 100
+    default 35
     range 10 5000
     help
       Cadence at which the adaptive-retry worker recomputes the target
@@ -67,24 +67,23 @@ config ZMK_ESB_ENDPOINT_ADAPTIVE_RETRY_EWMA_LOW
     help
       Below this EWMA value (in tx_attempts × 10) the link is treated as
       near-perfect — mostly 1-attempt packets — and retransmit_count is
-      pinned at COUNT_MIN. Default 15 corresponds to 1.5 average attempts.
+      pinned at COUNT_MIN.
 
 config ZMK_ESB_ENDPOINT_ADAPTIVE_RETRY_EWMA_HIGH
     int "Adaptive retry: upper EWMA breakpoint (attempts × 10)"
     depends on ZMK_ESB_ENDPOINT_ADAPTIVE_RETRY
-    default 30
+    default 45
     range 11 200
     help
       At or above this EWMA value (in tx_attempts × 10) the link is
       treated as degraded and retransmit_count is pinned at COUNT_MAX.
       Between LOW and HIGH the count is linearly interpolated, rounded
-      toward COUNT_MIN. Must be greater than EWMA_LOW. Default 30
-      corresponds to 3.0 average attempts.
+      toward COUNT_MIN. Must be greater than EWMA_LOW.
 
 config ZMK_ESB_ENDPOINT_ADAPTIVE_RETRY_COUNT_MIN
     int "Adaptive retry: minimum retransmit_count on a clean link"
     depends on ZMK_ESB_ENDPOINT_ADAPTIVE_RETRY
-    default 4
+    default 2
     range 0 15
     help
       Floor for the adaptive retransmit_count. Applied when the EWMA is
@@ -151,7 +150,7 @@ config ESB_MAX_PAYLOAD_LENGTH
 
 config ESB_TX_FIFO_SIZE
     int "ESB TX FIFO depth"
-    default 24 if ZMK_ESB_ENDPOINT_SHELL_RELAY
+    default 64 if ZMK_ESB_ENDPOINT_SHELL_RELAY
     default 8
 
 config ESB_RX_FIFO_SIZE
@@ -224,7 +223,7 @@ config ZMK_ESB_ENDPOINT_HID_NOACK
 
 config ZMK_ESB_ENDPOINT_RETRANSMIT_COUNT
     int "ESB retransmit count for ACKed packets"
-    default 9
+    default 5
     range 0 15
     help
       Applies to control packets (BEACON/PAIR/DISCONNECT). HID reports sent
@@ -233,11 +232,11 @@ config ZMK_ESB_ENDPOINT_RETRANSMIT_COUNT
 
 config ZMK_ESB_ENDPOINT_RETRANSMIT_DELAY_US
     int "ESB retransmit delay (microseconds)"
-    default 470
+    default 630
 
 config ZMK_ESB_ENDPOINT_POINTER_RETRANSMIT_COUNT
     int "ESB retransmit count for pointer/scroll-only mouse reports"
-    default 3
+    default 2
     range 0 15
     help
       Mouse reports that carry pointer or scroll motion but no button
@@ -267,7 +266,7 @@ config ZMK_ESB_ENDPOINT_POINTER_MOTION_RING_SIZE
 
 config ZMK_ESB_ENDPOINT_POINTER_REFUND_STALE_MS
     int "Drop accumulated pointer-refund deltas older than this (ms)"
-    default 25
+    default 32
     range 1 5000
     help
       Maximum age of pending pointer/scroll refund deltas before they
@@ -677,7 +676,7 @@ config ZMK_ESB_ENDPOINT_LINK_QUALITY_WINDOW
 
 config ZMK_ESB_ENDPOINT_LINK_DEGRADED_THRESHOLD
     int "Cooperative-hop trigger: retried packets in window"
-    default 5
+    default 10
     range 1 32
     help
       The cooperative-hop handshake fires when at least this many of the
@@ -696,7 +695,7 @@ config ZMK_ESB_ENDPOINT_LINK_DEGRADED_REARM
 
 config ZMK_ESB_ENDPOINT_LINK_DEGRADED_FAST_THRESHOLD
     int "Cooperative-hop trigger: retried packets in last 8"
-    default 3
+    default 4
     range 0 8
     help
       Fast-path trigger: also fire if at least this many of the most

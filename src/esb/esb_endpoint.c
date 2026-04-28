@@ -307,10 +307,43 @@ static int cmd_esb_status(const struct shell *sh, const size_t argc, char **argv
 
     int8_t r_last, r_ewma;
     if (esb_transport_get_peer_rssi(&r_last, &r_ewma)) {
-        shell_print(sh, "rssi:     last=%d ewma=%d (dBm, peer)",
-                    (int)r_last, (int)r_ewma);
+        shell_print(sh, "rssi:     -%d dBm, ewma: -%d dBm", (int)r_last, (int)r_ewma);
     } else {
         shell_print(sh, "rssi:     n/a");
+    }
+
+#if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_HOP)
+    {
+        uint8_t  lq_retried = 0;
+        uint16_t lq_ewma_x10 = 0;
+        esb_transport_get_link_quality(&lq_retried, &lq_ewma_x10);
+        shell_print(sh, "link:     ewma=%u.%u attempts, retried=%u/%u in window",
+                    (unsigned)(lq_ewma_x10 / 10u),
+                    (unsigned)(lq_ewma_x10 % 10u),
+                    (unsigned)lq_retried,
+                    (unsigned)CONFIG_ZMK_ESB_ENDPOINT_LINK_QUALITY_WINDOW);
+    }
+#endif
+
+    {
+        uint32_t tx_ok = 0, tx_retried = 0, tx_exhausted = 0;
+        esb_transport_get_per_stats(&tx_ok, &tx_retried, &tx_exhausted);
+        const uint32_t tx_total = tx_ok + tx_exhausted;
+        if (tx_total > 0) {
+            /* per-mille so we can render one decimal without floats */
+            const uint32_t per_pm   = (tx_exhausted * 1000u) / tx_total;
+            const uint32_t retry_pm = (tx_ok > 0)
+                ? (tx_retried * 1000u) / tx_ok : 0u;
+            shell_print(sh,
+                "TX:       ok=%u retried=%u (%u.%u%%) failed=%u (PER %u.%u%%)",
+                (unsigned)tx_ok,
+                (unsigned)tx_retried,
+                (unsigned)(retry_pm / 10u), (unsigned)(retry_pm % 10u),
+                (unsigned)tx_exhausted,
+                (unsigned)(per_pm / 10u), (unsigned)(per_pm % 10u));
+        } else {
+            shell_print(sh, "TX:       ok=0 retried=0 failed=0");
+        }
     }
 
     uint32_t hid_total = 0;
@@ -321,46 +354,11 @@ static int cmd_esb_status(const struct shell *sh, const size_t argc, char **argv
     return 0;
 }
 
-#if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_HOP)
-static int cmd_esb_channel(const struct shell *sh, const size_t argc, char **argv) {
-    ARG_UNUSED(argc);
-    ARG_UNUSED(argv);
-    const uint8_t cur = esb_transport_get_channel();
-    const uint8_t nxt = channel_hop_ep_get_committed();
-    const uint8_t qn  = channel_hop_ep_get_quarantine_count();
-
-    shell_print(sh, "current:   %u", cur);
-    if (nxt == CHANNEL_HOP_INVALID) {
-        shell_print(sh, "committed: <none>");
-    } else {
-        shell_print(sh, "committed: %u", nxt);
-    }
-    shell_print(sh, "state:     %s",
-                channel_hop_ep_is_active() ? "active" : "idle");
-    shell_print(sh, "quarantined channels: %u", qn);
-    if (qn > 0) {
-        shell_fprintf(sh, SHELL_NORMAL, "  [");
-        bool first = true;
-        for (uint8_t ch = 0; ch < CHANNEL_HOP_CHANNEL_COUNT; ch++) {
-            if (channel_hop_ep_is_quarantined(ch)) {
-                shell_fprintf(sh, SHELL_NORMAL, "%s%u", first ? "" : ", ", ch);
-                first = false;
-            }
-        }
-        shell_print(sh, "]");
-    }
-    return 0;
-}
-#endif
-
 SHELL_STATIC_SUBCMD_SET_CREATE(esb_cmds,
     SHELL_CMD(unpair, NULL, "Forget paired dongle and start beaconing", cmd_esb_unpair),
-    SHELL_CMD(status, NULL, "Show pairing, channel, RSSI and HID rate", cmd_esb_status),
+    SHELL_CMD(stats, NULL, "Show available statistics", cmd_esb_status),
 #if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_BENCH)
     SHELL_CMD(bench, NULL, "Run ESB link benchmark (run twice: start, then read results)", cmd_esb_bench),
-#endif
-#if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_HOP)
-    SHELL_CMD(channel, NULL, "Show current RF channel, committed next hop, and quarantined channels", cmd_esb_channel),
 #endif
     SHELL_SUBCMD_SET_END
 );
