@@ -11,8 +11,8 @@ config ZMK_ESB_ENDPOINT_SHELL_RELAY
 
 config ZMK_ESB_ENDPOINT_SHELL_POLL_INTERVAL_MS
     int "Shell poll interval (ms)"
-    default 50
-    range 10 500
+    default 20
+    range 5 500
     depends on ZMK_ESB_ENDPOINT_SHELL_RELAY
     help
       How often the keyboard sends SHELL_POLL packets to solicit queued
@@ -55,7 +55,7 @@ config ZMK_ESB_ENDPOINT_SHELL_BG_POLL
 
 config ZMK_ESB_ENDPOINT_SHELL_BG_POLL_MS
     int "Background ACK poll interval while shell is idle (ms)"
-    default 500
+    default 100
     range 100 5000
     depends on ZMK_ESB_ENDPOINT_SHELL_BG_POLL
     help

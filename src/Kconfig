@@ -145,8 +145,8 @@ if ESB
 
 config ESB_MAX_PAYLOAD_LENGTH
     int "Maximum ESB payload size"
-    default 24
-    range 1 252
+    default 32
+    range 1 32
 
 config ESB_TX_FIFO_SIZE
     int "ESB TX FIFO depth"
@@ -155,8 +155,8 @@ config ESB_TX_FIFO_SIZE
 
 config ESB_RX_FIFO_SIZE
     int "ESB RX FIFO depth"
-    default 12 if ZMK_ESB_ENDPOINT_SHELL_RELAY
-    default 6
+    default 32 if ZMK_ESB_ENDPOINT_SHELL_RELAY
+    default 8
 
 config ESB_PIPE_COUNT
     int "ESB pipe count"
@@ -232,7 +232,7 @@ config ZMK_ESB_ENDPOINT_RETRANSMIT_COUNT
 
 config ZMK_ESB_ENDPOINT_RETRANSMIT_DELAY_US
     int "ESB retransmit delay (microseconds)"
-    default 630
+    default 570
 
 config ZMK_ESB_ENDPOINT_POINTER_RETRANSMIT_COUNT
     int "ESB retransmit count for pointer/scroll-only mouse reports"
