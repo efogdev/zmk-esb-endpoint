@@ -449,7 +449,7 @@ if ZMK_ESB_ENDPOINT_CHANNEL_HOP
 
 config ZMK_ESB_ENDPOINT_HOP_RETRY_DELAY_MS
     int "Hop-worker re-arm delay after esb_transport_set_channel -EBUSY (ms)"
-    default 12 if ZMK_ESB_ENDPOINT_CRITICAL_MAX_RETRANSMIT
+    default 10 if ZMK_ESB_ENDPOINT_CRITICAL_MAX_RETRANSMIT
     default 5
     range 1 100
     help
@@ -466,7 +466,7 @@ config ZMK_ESB_ENDPOINT_HOP_RETRY_DELAY_MS
 
 config ZMK_ESB_ENDPOINT_CHANNEL_HOP_TX_FAIL_WINDOW_MS
     int "Continuous TX-failure duration before triggering a channel hop (ms)"
-    default 35
+    default 32
     range 2 1000
     help
       A channel hop fires once TX has been failing continuously for this
@@ -478,7 +478,7 @@ config ZMK_ESB_ENDPOINT_CHANNEL_HOP_TX_FAIL_WINDOW_MS
 
 config ZMK_ESB_ENDPOINT_CHANNEL_HOP_WEAK_LINK_MS
     int "No-TX_SUCCESS duration before triggering a weak-link hop (ms)"
-    default 200
+    default 80
     range 0 5000
     help
       Hop if no TX_SUCCESS has arrived for this long while actively
@@ -509,7 +509,7 @@ config ZMK_ESB_ENDPOINT_CHANNEL_HOP_POST_QUIET_MS
 
 config ZMK_ESB_ENDPOINT_MOTION_MAX_STALE_MS
     int "Drop accumulated pointer motion older than this (ms)"
-    default 500
+    default 100
     range 1 5000
     help
       Maximum age of accumulated pointer deltas in the ESB input
@@ -552,7 +552,7 @@ config ZMK_ESB_ENDPOINT_CHANNEL_HOP_NEGOTIATE_INTERVAL_MS
 
 config ZMK_ESB_ENDPOINT_CHANNEL_HOP_NEGOTIATE_RETRY_MS
     int "Negotiation retry interval while committed_next is missing (ms)"
-    default 200
+    default 50
     range 20 5000
     help
       If the endpoint has no committed_next (e.g. fresh connect, post-
@@ -578,7 +578,7 @@ config ZMK_ESB_ENDPOINT_CHANNEL_HOP_REQUEST_BURST_COUNT
 
 config ZMK_ESB_ENDPOINT_IDLE_THRESHOLD_MS
     int "Time without user TX before declaring the endpoint idle (ms)"
-    default 150
+    default 50
     range 50 60000
     help
       If no HID / shell-relay packet is sent for this long, the endpoint
@@ -604,7 +604,7 @@ config ZMK_ESB_ENDPOINT_CHANNEL_HOP_POST_BURST_COUNT
 
 config ZMK_ESB_ENDPOINT_CHANNEL_HOP_POST_BURST_INTERVAL_MS
     int "Post-hop PROPOSAL burst interval (ms between packets)"
-    default 35
+    default 15
     range 5 1000
 
 config ZMK_ESB_ENDPOINT_CHANNEL_HOP_POST_BURST_RENDEZVOUS_EVERY
@@ -622,7 +622,7 @@ config ZMK_ESB_ENDPOINT_CHANNEL_HOP_POST_BURST_RENDEZVOUS_EVERY
 
 config ZMK_ESB_ENDPOINT_CHANNEL_HOP_RENDEZVOUS_TIMEOUT_MS
     int "Synchronous rendezvous PROPOSAL TX timeout (ms)"
-    default 25
+    default 10
     range 1 50
     help
       Hard cap on how long the post-hop burst handler will block waiting
@@ -633,7 +633,7 @@ config ZMK_ESB_ENDPOINT_CHANNEL_HOP_RENDEZVOUS_TIMEOUT_MS
 
 config ZMK_ESB_ENDPOINT_CHANNEL_HOP_RENDEZVOUS_FALLBACK_MS
     int "Force a rendezvous-channel hop after this many ms of post-hop TX failure"
-    default 550
+    default 200
     range 0 10000
     help
       If TX continues to fail for this long after a hop committed (i.e.
@@ -654,7 +654,7 @@ config ZMK_ESB_ENDPOINT_CHANNEL_HOP_RENDEZVOUS_FALLBACK_MS
 
 config ZMK_ESB_ENDPOINT_CHANNEL_HOP_COOLDOWN_MS
     int "Minimum dwell on the new channel before another hop can fire (ms)"
-    default 850
+    default 250
     range 0 10000
     help
       After a successful channel hop, TX-failure-triggered hops are
@@ -705,7 +705,7 @@ config ZMK_ESB_ENDPOINT_LINK_DEGRADED_FAST_THRESHOLD
 
 config ZMK_ESB_ENDPOINT_COOP_HOP_HOP_IN_MS
     int "Cooperative hop: delay between OFFER delivery and channel switch (ms)"
-    default 5
+    default 4
     range 2 50
     help
       How long after the HOP_OFFER is delivered both sides wait before
