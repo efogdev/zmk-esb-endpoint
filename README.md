@@ -155,8 +155,9 @@ a dongle that missed the hop entirely. If TX never recovers within
 `RENDEZVOUS_FALLBACK_MS` the endpoint forces a hop back to the
 rendezvous channel, bypassing both quarantine and cooldown.
 
-`esb channel` shell command prints the current channel, committed next,
-active/idle state, and the quarantine list.
+The `esb stats` shell command prints the current channel, committed
+next, hop active/idle state, RSSI, link-quality window, and per-link
+TX / HID counters.
 
 ## Link benchmark (optional)
 
@@ -172,7 +173,7 @@ Core:
 | Kconfig                                        | What it does |
 |------------------------------------------------|--------------|
 | `ZMK_ESB_ENDPOINT_HID_NOACK`                   | Mouse fire-and-forget (default off). |
-| `ZMK_ESB_ENDPOINT_RETRANSMIT_COUNT` / `_DELAY_US` | ACKed-packet retransmit policy (default 7 retries, 560 µs delay). |
+| `ZMK_ESB_ENDPOINT_RETRANSMIT_COUNT` / `_DELAY_US` | ACKed-packet retransmit policy (default 5 retries, 570 µs delay). |
 | `ZMK_ESB_ENDPOINT_BEACON_INTERVAL_MS`          | Beacon rate while unpaired. |
 | `ZMK_ESB_ENDPOINT_BEACON_INITIAL_DELAY_MS`     | Delay before first beacon after activate / unpair / disconnect. |
 | `ZMK_ESB_ENDPOINT_VERIFY_INTERVAL_MS`          | Identity `VERIFY_REQ` retransmit cadence during reconnect. |
@@ -230,10 +231,10 @@ Benchmark (`ZMK_ESB_ENDPOINT_BENCH`):
 | `..._BENCH_RESULT_POLL_MS`          | Poll interval while draining results. |
 | `..._BENCH_RESULT_TIMEOUT_MS`       | Max wait for dongle result. |
 
-ESB transport defaults tuned by this module (in `src/Kconfig`): payload
-length 24, pipe count 2, RX FIFO depth 8, `ESB_NEVER_DISABLE_TX=y`; TX
-FIFO depth defaults to 8 and is bumped to 16 when the shell relay is
-enabled.
+ESB transport defaults tuned by this module (in `src/Kconfig`): max
+payload length 32, pipe count 2, `ESB_NEVER_DISABLE_TX=y`; TX FIFO depth
+and RX FIFO depth both default to 8 and are bumped to 64 / 32
+respectively when the shell relay is enabled.
 
 ## SoC note
 
@@ -257,8 +258,9 @@ and the module will not just build and run on anything else without edits:
 - Checking `NVIC_NUM_VECTORS` — the 52840 is also 48 external so this
   happens to match, but verify.
 - Making sure no other subsystem on your board is already using `TIMER2`.
-- Confirming the `--wrap=bt_le_adv_start*` symbol names still exist in the
-  host version you're linking against.
+- Confirming the `--wrap=bt_le_adv_*` symbol names still exist in the
+  host version you're linking against (`bt_le_adv_start`,
+  `bt_le_adv_update_data`, `bt_le_adv_start_legacy`).
 
 ## Worth knowing
 
