@@ -34,6 +34,7 @@
 #endif
 
 #include "zmk/ble.h"
+#include "zmk/hog.h"
 LOG_MODULE_REGISTER(zmk_esb_endpoint, CONFIG_ZMK_ESB_ENDPOINT_LOG_LEVEL);
 
 #if IS_ENABLED(CONFIG_ZMK_ADAPTIVE_FEEDBACK)
@@ -129,6 +130,39 @@ int __wrap_bt_le_adv_start_legacy(struct bt_le_ext_adv *adv,
     }
     return __real_bt_le_adv_start_legacy(adv, param, ad, ad_len, sd, sd_len);
 }
+
+/* While ESB owns the radio the active BLE profile has no peer (BT_ADDR_LE_ANY),
+ * yet endpoints.c keeps routing HID reports to HoG: with USB unplugged and BLE
+ * "not ready", get_selected_transport() falls through to DEFAULT_TRANSPORT,
+ * which is BLE whenever CONFIG_ZMK_BLE=y. Each queued report then runs
+ * zmk_ble_active_profile_conn(), which logs a LOG_WRN per call. Drop the
+ * reports at the entrypoint so nothing enters hog_work_q and the BLE LL is
+ * never touched. */
+int __real_zmk_hog_send_keyboard_report(struct zmk_hid_keyboard_report_body *body);
+int __wrap_zmk_hog_send_keyboard_report(struct zmk_hid_keyboard_report_body *body) {
+    if (esb_active) {
+        return 0;
+    }
+    return __real_zmk_hog_send_keyboard_report(body);
+}
+
+int __real_zmk_hog_send_consumer_report(struct zmk_hid_consumer_report_body *body);
+int __wrap_zmk_hog_send_consumer_report(struct zmk_hid_consumer_report_body *body) {
+    if (esb_active) {
+        return 0;
+    }
+    return __real_zmk_hog_send_consumer_report(body);
+}
+
+#if IS_ENABLED(CONFIG_ZMK_POINTING)
+int __real_zmk_hog_send_mouse_report(struct zmk_hid_mouse_report_body *body);
+int __wrap_zmk_hog_send_mouse_report(struct zmk_hid_mouse_report_body *body) {
+    if (esb_active) {
+        return 0;
+    }
+    return __real_zmk_hog_send_mouse_report(body);
+}
+#endif
 
 static void esb_ctrl_thread_fn(void *p1, void *p2, void *p3) {
     int cmd;

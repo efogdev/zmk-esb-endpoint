@@ -37,6 +37,38 @@ config ZMK_ESB_ENDPOINT_SHELL_OUT_BUF_SIZE
     default 2048
     depends on ZMK_ESB_ENDPOINT_SHELL_RELAY
 
+config ZMK_ESB_ENDPOINT_SHELL_STDOUT_COALESCE_BYTES
+    int "stdout hook coalescing buffer size (bytes)"
+    default 32
+    range 16 256
+    depends on ZMK_ESB_ENDPOINT_SHELL_RELAY
+    help
+      printk/puts emit one byte at a time through the stdout hook.
+      Without coalescing every byte triggers out_enqueue + out_drain_work,
+      producing one tiny ESB packet per byte. The hook accumulates bytes
+      and flushes when this buffer fills or after STDOUT_COALESCE_MS of
+      no further hook activity.
+
+config ZMK_ESB_ENDPOINT_SHELL_STDOUT_COALESCE_MS
+    int "stdout hook coalescing idle flush (ms)"
+    default 5
+    range 1 100
+    depends on ZMK_ESB_ENDPOINT_SHELL_RELAY
+    help
+      Flush the stdout coalescing buffer after this many milliseconds of
+      no further bytes from the stdout hook.
+
+config ZMK_ESB_ENDPOINT_SHELL_LOG_LINE_BUF_SIZE
+    int "Per-message log staging buffer size (bytes)"
+    default 96
+    range 32 512
+    depends on ZMK_ESB_ENDPOINT_SHELL_RELAY
+    help
+      Size of the staging buffer LOG_OUTPUT_DEFINE hands to the ESB log
+      backend's output function. A formatted log message larger than
+      this is fragmented into multiple out_enqueue calls. Larger values
+      keep long log lines contiguous at the cost of more permanent RAM.
+
 config ZMK_ESB_ENDPOINT_SHELL_PROMPT
     string "Shell prompt string"
     default SHELL_PROMPT_UART
@@ -79,6 +111,36 @@ config ZMK_ESB_ENDPOINT_SHELL_INITIAL_POLL_DELAY_MS
     default 20
     range 5 500
     depends on ZMK_ESB_ENDPOINT_SHELL_RELAY
+
+config ZMK_ESB_ENDPOINT_SHELL_STOP_NUDGE_COOLDOWN_MS
+    int "SHELL_STOP nudge cooldown (ms)"
+    default 5000
+    range 50 60000
+    depends on ZMK_ESB_ENDPOINT_SHELL_RELAY
+    help
+      Minimum interval between SHELL_STOP nudges sent to the dongle when
+      SHELL_DATA arrives but the keyboard has no active session. Debounces
+      a burst of in-flight payloads following an unexpected dongle state.
+
+config ZMK_ESB_ENDPOINT_SHELL_EXEC_STACK_SIZE
+    int "Stack size for the shell-exec work queue (bytes)"
+    default 2048
+    range 1024 8192
+    depends on ZMK_ESB_ENDPOINT_SHELL_RELAY
+    help
+      Dedicated work queue runs shell_execute_cmd off the system workqueue
+      so a long-running NVS-bound command (settings_load_subtree_direct)
+      does not block shell_poll_work / out_drain_work / etc. 
+
+config ZMK_ESB_ENDPOINT_SHELL_EXEC_PRIORITY
+    int "Priority of the shell-exec work queue thread"
+    default 7
+    range 0 14
+    depends on ZMK_ESB_ENDPOINT_SHELL_RELAY
+    help
+      Cooperative-thread priority (passed through K_PRIO_PREEMPT). Keep
+      below the system workqueue priority so HID / radio work is not
+      starved by a slow shell command.
 
 config SHELL_BACKEND_DUMMY_BUF_SIZE
     default 2048 if ZMK_ESB_ENDPOINT_SHELL_RELAY

@@ -29,6 +29,9 @@
 #include "shell_relay.h"
 
 #include <zephyr/logging/log.h>
+#include <zephyr/logging/log_backend.h>
+#include <zephyr/logging/log_output.h>
+#include <zephyr/logging/log_core.h>
 LOG_MODULE_REGISTER(zmk_esb_shell, CONFIG_ZMK_ESB_ENDPOINT_LOG_LEVEL);
 
 static bool m_shell_active;
@@ -43,6 +46,8 @@ static void shell_exec_work_fn(struct k_work *w);
 static void shell_poll_work_fn(struct k_work *w);
 static void inactivity_work_fn(struct k_work *w);
 static void out_drain_work_fn(struct k_work *w);
+static void stdout_flush_work_fn(struct k_work *w);
+static void stdout_buf_reset(void);
 #if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_SHELL_BG_POLL)
 static void bg_poll_work_fn(struct k_work *w);
 #endif
@@ -51,14 +56,43 @@ static K_WORK_DEFINE(shell_exec_work, shell_exec_work_fn);
 static K_WORK_DELAYABLE_DEFINE(shell_poll_work, shell_poll_work_fn);
 static K_WORK_DELAYABLE_DEFINE(inactivity_work, inactivity_work_fn);
 static K_WORK_DEFINE(out_drain_work, out_drain_work_fn);
+static K_WORK_DELAYABLE_DEFINE(stdout_flush_work, stdout_flush_work_fn);
 #if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_SHELL_BG_POLL)
 static K_WORK_DELAYABLE_DEFINE(bg_poll_work, bg_poll_work_fn);
 #endif
+
+/* Coalescing buffer for the stdout hook. printk/puts feed the hook one byte
+ * at a time; without coalescing every byte would produce its own
+ * out_enqueue + out_drain_work submission, fragmenting the stream into
+ * one ESB packet per byte. Bytes are flushed when the buffer fills or
+ * after SHELL_STDOUT_COALESCE_MS of hook inactivity. */
+static uint8_t stdout_buf[CONFIG_ZMK_ESB_ENDPOINT_SHELL_STDOUT_COALESCE_BYTES];
+static size_t stdout_buf_len;
+static struct k_spinlock stdout_buf_lock;
+
+/* Dedicated work queue for shell_exec_work. Keeps long-running NVS-bound
+ * commands (e.g. settings_load_subtree_direct) off the system workqueue so
+ * shell_poll_work / out_drain_work / radio housekeeping keep firing while a
+ * command runs, and gives shell_execute_cmd enough stack to absorb VLA-using
+ * settings callbacks that overflow the system workqueue's 1 KB default. */
+static K_THREAD_STACK_DEFINE(shell_exec_stack,
+                             CONFIG_ZMK_ESB_ENDPOINT_SHELL_EXEC_STACK_SIZE);
+static struct k_work_q shell_exec_q;
+
+/* Tracks the column the dongle's CDC cursor will be on after the bytes
+ * currently queued in out_rb are flushed. Used to decide whether a log
+ * message needs a leading CRLF to escape the prompt or mid-typed input.
+ * Only reflects what the keyboard has emitted — the dongle's local input
+ * echo is not visible here, so this is best-effort. */
+static bool m_at_line_start = true;
 
 static void out_enqueue(const uint8_t *data, const size_t len) {
     const uint32_t put = ring_buf_put(&out_rb, data, (uint32_t)len);
     if (put < len) {
         LOG_WRN("out_rb full: dropped %zu bytes", len - put);
+    }
+    if (put > 0) {
+        m_at_line_start = (data[put - 1] == '\n');
     }
 }
 
@@ -170,6 +204,7 @@ static void inactivity_work_fn(struct k_work *w) {
             CONFIG_ZMK_ESB_ENDPOINT_SHELL_INACTIVITY_S);
     m_shell_active = false;
     k_work_cancel_delayable(&shell_poll_work);
+    stdout_buf_reset();
     ring_buf_reset(&out_rb);
     struct esb_pkt_shell_stop pkt = { .type = ESB_PKT_SHELL_STOP };
     esb_transport_send(ESB_PIPE_DATA, (uint8_t *)&pkt, sizeof(pkt));
@@ -190,13 +225,122 @@ static void bg_poll_work_fn(struct k_work *w) {
 }
 #endif
 
-void esb_shell_relay_init(void) {}
+static bool in_log_emit;
+static uint8_t log_line_buf[CONFIG_ZMK_ESB_ENDPOINT_SHELL_LOG_LINE_BUF_SIZE];
+
+static int log_out_func(uint8_t *buf, const size_t size, void *ctx) {
+    ARG_UNUSED(ctx);
+    if (m_shell_active) {
+        out_enqueue(buf, size);
+        k_work_submit(&out_drain_work);
+    }
+    return (int)size;
+}
+
+LOG_OUTPUT_DEFINE(log_output_esb, log_out_func, log_line_buf, sizeof(log_line_buf));
+
+static const uint32_t ESB_LOG_FLAGS =
+    LOG_OUTPUT_FLAG_LEVEL | LOG_OUTPUT_FLAG_COLORS |
+    LOG_OUTPUT_FLAG_TIMESTAMP | LOG_OUTPUT_FLAG_FORMAT_TIMESTAMP;
+
+static void esb_log_backend_process(const struct log_backend *const backend,
+                                    union log_msg_generic *msg) {
+    ARG_UNUSED(backend);
+    if (!m_shell_active || in_log_emit) {
+        return;
+    }
+    in_log_emit = true;
+    if (!m_at_line_start) {
+        static const uint8_t crlf[] = "\r\n";
+        out_enqueue(crlf, sizeof(crlf) - 1);
+    }
+    log_output_msg_process(&log_output_esb, &msg->log, ESB_LOG_FLAGS);
+    in_log_emit = false;
+}
+
+static void esb_log_backend_dropped(const struct log_backend *const backend, const uint32_t cnt) {
+    ARG_UNUSED(backend);
+    log_output_dropped_process(&log_output_esb, cnt);
+}
+
+static void esb_log_backend_panic(const struct log_backend *const backend) {
+    ARG_UNUSED(backend);
+    log_output_flush(&log_output_esb);
+}
+
+static int esb_log_backend_format_set(const struct log_backend *const backend, const uint32_t type) {
+    ARG_UNUSED(backend);
+    ARG_UNUSED(type);
+    return 0;
+}
+
+static const struct log_backend_api esb_log_backend_api = {
+    .process    = esb_log_backend_process,
+    .dropped    = esb_log_backend_dropped,
+    .panic      = esb_log_backend_panic,
+    .format_set = esb_log_backend_format_set,
+};
+
+LOG_BACKEND_DEFINE(esb_shell_log_backend, esb_log_backend_api, true);
+
+extern void __stdout_hook_install(int (*hook)(int));
+
+static void stdout_flush_work_fn(struct k_work *w) {
+    ARG_UNUSED(w);
+    uint8_t tmp[sizeof(stdout_buf)];
+    const k_spinlock_key_t key = k_spin_lock(&stdout_buf_lock);
+    const size_t n = stdout_buf_len;
+    if (n > 0) {
+        memcpy(tmp, stdout_buf, n);
+        stdout_buf_len = 0;
+    }
+    k_spin_unlock(&stdout_buf_lock, key);
+    if (n == 0 || !m_shell_active) {
+        return;
+    }
+    out_enqueue(tmp, n);
+    k_work_submit(&out_drain_work);
+}
+
+static void stdout_buf_reset(void) {
+    k_work_cancel_delayable(&stdout_flush_work);
+    const k_spinlock_key_t key = k_spin_lock(&stdout_buf_lock);
+    stdout_buf_len = 0;
+    k_spin_unlock(&stdout_buf_lock, key);
+}
+
+static int esb_stdout_hook(const int c) {
+    if (!m_shell_active) {
+        return c;
+    }
+    bool full;
+    const k_spinlock_key_t key = k_spin_lock(&stdout_buf_lock);
+    if (stdout_buf_len < sizeof(stdout_buf)) {
+        stdout_buf[stdout_buf_len++] = (uint8_t)c;
+    }
+    full = (stdout_buf_len >= sizeof(stdout_buf));
+    k_spin_unlock(&stdout_buf_lock, key);
+    k_work_reschedule(&stdout_flush_work,
+                      full ? K_NO_WAIT : K_MSEC(CONFIG_ZMK_ESB_ENDPOINT_SHELL_STDOUT_COALESCE_MS));
+    return c;
+}
+
+void esb_shell_relay_init(void) {
+    __stdout_hook_install(esb_stdout_hook);
+    k_work_queue_init(&shell_exec_q);
+    k_work_queue_start(&shell_exec_q, shell_exec_stack,
+                       K_THREAD_STACK_SIZEOF(shell_exec_stack),
+                       K_PRIO_PREEMPT(CONFIG_ZMK_ESB_ENDPOINT_SHELL_EXEC_PRIORITY),
+                       NULL);
+    k_thread_name_set(&shell_exec_q.thread, "esb_shell_exec");
+}
 
 void esb_shell_relay_on_connected(void) {
     LOG_DBG("connected, resetting shell state");
     m_shell_active = false;
     k_work_cancel_delayable(&shell_poll_work);
     k_work_cancel_delayable(&inactivity_work);
+    stdout_buf_reset();
     ring_buf_reset(&out_rb);
     k_mutex_lock(&cmd_mutex, K_FOREVER);
     cmd_len = 0;
@@ -217,6 +361,7 @@ void esb_shell_relay_on_disconnected(void) {
     m_shell_active = false;
     k_work_cancel_delayable(&shell_poll_work);
     k_work_cancel_delayable(&inactivity_work);
+    stdout_buf_reset();
     ring_buf_reset(&out_rb);
 }
 
@@ -228,6 +373,7 @@ void esb_shell_relay_on_req(void) {
     LOG_DBG("SHELL_REQ received, entering active shell mode");
     m_shell_active = true;
     cmd_len = 0;
+    stdout_buf_reset();
     ring_buf_reset(&out_rb);
 #if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_SHELL_BG_POLL)
     k_work_cancel_delayable(&bg_poll_work);
@@ -251,7 +397,7 @@ void esb_shell_relay_on_data(const uint8_t *data, const uint8_t len) {
              * is dropped. Cooldown debounces a burst of in-flight payloads. */
             static int64_t last_nudge_ms;
             const int64_t now = k_uptime_get();
-            if (now - last_nudge_ms > 1000) {
+            if (now - last_nudge_ms > CONFIG_ZMK_ESB_ENDPOINT_SHELL_STOP_NUDGE_COOLDOWN_MS) {
                 last_nudge_ms = now;
                 struct esb_pkt_shell_stop pkt = { .type = ESB_PKT_SHELL_STOP };
                 esb_transport_send(ESB_PIPE_DATA, (uint8_t *)&pkt, sizeof(pkt));
@@ -263,6 +409,7 @@ void esb_shell_relay_on_data(const uint8_t *data, const uint8_t len) {
     if (CONFIG_ZMK_ESB_ENDPOINT_SHELL_INACTIVITY_S > 0) {
         k_work_reschedule(&inactivity_work, K_SECONDS(CONFIG_ZMK_ESB_ENDPOINT_SHELL_INACTIVITY_S));
     }
+    bool need_drain = false;
     k_mutex_lock(&cmd_mutex, K_FOREVER);
     for (uint8_t i = 0; i < len; i++) {
         const uint8_t b = data[i];
@@ -272,8 +419,15 @@ void esb_shell_relay_on_data(const uint8_t *data, const uint8_t len) {
                 cmd_len = 0;
                 k_mutex_unlock(&cmd_mutex);
                 LOG_DBG("command ready, submitting exec work");
-                k_work_submit(&shell_exec_work);
+                k_work_submit_to_queue(&shell_exec_q, &shell_exec_work);
                 k_mutex_lock(&cmd_mutex, K_FOREVER);
+            }
+        } else if (b == 0x7F || b == 0x08) {
+            if (cmd_len > 0) {
+                cmd_len--;
+                static const uint8_t erase[] = "\b \b";
+                out_enqueue(erase, sizeof(erase) - 1);
+                need_drain = true;
             }
         } else if (cmd_len < sizeof(cmd_buf) - 1) {
             cmd_buf[cmd_len++] = (char)b;
@@ -282,6 +436,9 @@ void esb_shell_relay_on_data(const uint8_t *data, const uint8_t len) {
         }
     }
     k_mutex_unlock(&cmd_mutex);
+    if (need_drain) {
+        k_work_submit(&out_drain_work);
+    }
 }
 
 bool esb_shell_relay_is_active(void) {

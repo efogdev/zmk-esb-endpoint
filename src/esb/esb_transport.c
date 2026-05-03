@@ -128,9 +128,12 @@ static uint16_t m_hid_tx_rate_hz;
 /* Parallel ring tracking which recent sends had the override applied.
  * Independent from m_recent_noack[] (which only exists when CHANNEL_HOP is
  * compiled in) so the critical-packet feature works for BEACON/PAIR_RESP/
- * VERIFY_REQ/DISCONNECT even with channel hopping disabled. */
-#define CRIT_OVERRIDE_RING_SIZE 8
-static uint8_t  m_recent_critical_override[CRIT_OVERRIDE_RING_SIZE];
+ * VERIFY_REQ/DISCONNECT even with channel hopping disabled. Indexed via
+ * `& (SIZE - 1)`, so the depth must be a power of two. */
+BUILD_ASSERT((CONFIG_ZMK_ESB_ENDPOINT_CRIT_OVERRIDE_RING_SIZE &
+              (CONFIG_ZMK_ESB_ENDPOINT_CRIT_OVERRIDE_RING_SIZE - 1)) == 0,
+             "CRIT_OVERRIDE_RING_SIZE must be a power of two");
+static uint8_t  m_recent_critical_override[CONFIG_ZMK_ESB_ENDPOINT_CRIT_OVERRIDE_RING_SIZE];
 static uint8_t  m_recent_critical_head;
 static uint8_t  m_recent_critical_tail;
 #endif /* CRITICAL_MAX_RETRANSMIT */
@@ -256,18 +259,22 @@ static uint32_t m_tx_quiet_until_ms;
  * retransmit_count+1 sample is bounded by the radio ceiling rather
  * than the real delivery cost and would dominate the average.
  *
- * m_recent_noack[] tracks the noack flag of the last 8 sends in arrival
- * order, indexed by m_recent_noack_head (low 3 bits). Each TX event
+ * m_recent_noack[] tracks the noack flag of the most recent sends in
+ * arrival order, indexed by m_recent_noack_head & (RING_SIZE - 1)
+ * (depth set by LINK_QUALITY_NOACK_RING_SIZE). Each TX event
  * consumes the tail entry and skips the metric update if the matching
  * send was noack — those report tx_attempts=1 unconditionally and
  * would dilute the signal toward zero. The send-side push runs on the
  * same TX path that yields the event, so head/tail stay in sync as
  * long as we account for one push per event. */
-#define LQ_NOACK_RING_SIZE 8
+/* Indexed via `& (SIZE - 1)`, so the depth must be a power of two. */
+BUILD_ASSERT((CONFIG_ZMK_ESB_ENDPOINT_LINK_QUALITY_NOACK_RING_SIZE &
+              (CONFIG_ZMK_ESB_ENDPOINT_LINK_QUALITY_NOACK_RING_SIZE - 1)) == 0,
+             "LINK_QUALITY_NOACK_RING_SIZE must be a power of two");
 static uint32_t m_link_quality_window;
 static uint8_t  m_link_quality_count;
 static uint16_t m_link_quality_ewma_x10;
-static uint8_t  m_recent_noack[LQ_NOACK_RING_SIZE];
+static uint8_t  m_recent_noack[CONFIG_ZMK_ESB_ENDPOINT_LINK_QUALITY_NOACK_RING_SIZE];
 static uint8_t  m_recent_noack_head;
 static uint8_t  m_recent_noack_tail;
 
@@ -385,7 +392,7 @@ static bool consume_recent_noack(void) {
         return false;
     }
     const bool was_noack =
-        m_recent_noack[m_recent_noack_tail & (LQ_NOACK_RING_SIZE - 1)] != 0;
+        m_recent_noack[m_recent_noack_tail & (CONFIG_ZMK_ESB_ENDPOINT_LINK_QUALITY_NOACK_RING_SIZE - 1)] != 0;
     m_recent_noack_tail++;
     return was_noack;
 }
@@ -501,7 +508,7 @@ static bool consume_recent_override(void) {
         return false;
     }
     const bool was_override =
-        m_recent_critical_override[m_recent_critical_tail & (CRIT_OVERRIDE_RING_SIZE - 1)] != 0;
+        m_recent_critical_override[m_recent_critical_tail & (CONFIG_ZMK_ESB_ENDPOINT_CRIT_OVERRIDE_RING_SIZE - 1)] != 0;
     m_recent_critical_tail++;
     return was_override;
 }
@@ -1274,7 +1281,7 @@ int esb_transport_send(const uint8_t pipe, const uint8_t *data, uint8_t len) {
      * the next tail entry, which now corresponds to the post-flush
      * send — at worst we mis-attribute one packet's noack-ness, which
      * the wide window absorbs). */
-    m_recent_noack[m_recent_noack_head & (LQ_NOACK_RING_SIZE - 1)] =
+    m_recent_noack[m_recent_noack_head & (CONFIG_ZMK_ESB_ENDPOINT_LINK_QUALITY_NOACK_RING_SIZE - 1)] =
         noack ? 1U : 0U;
     m_recent_noack_head++;
 #endif
@@ -1333,7 +1340,7 @@ int esb_transport_send(const uint8_t pipe, const uint8_t *data, uint8_t len) {
         data[0] == ESB_PKT_CHANNEL_HOP_PROPOSAL ||
         data[0] == ESB_PKT_HOP_OFFER            ||
         data[0] == ESB_PKT_IDLE);
-    m_recent_critical_override[m_recent_critical_head & (CRIT_OVERRIDE_RING_SIZE - 1)] =
+    m_recent_critical_override[m_recent_critical_head & (CONFIG_ZMK_ESB_ENDPOINT_CRIT_OVERRIDE_RING_SIZE - 1)] =
         critical_override ? 1U : 0U;
     m_recent_critical_head++;
     if (critical_override) {

@@ -4,7 +4,9 @@
  *
  * Input processor that captures pointer events and forwards them over ESB.
  * Must be placed in the input-processors chain of each sensor listener in DTS.
- * Returns ZMK_INPUT_PROC_CONTINUE so the normal BLE/USB path also runs.
+ * Returns ZMK_INPUT_PROC_STOP after handling the event when the ESB endpoint
+ * is active and paired; returns ZMK_INPUT_PROC_CONTINUE otherwise so other
+ * transports (BLE/USB) can run.
  */
 
 #define DT_DRV_COMPAT zmk_esb_input_processor
@@ -23,15 +25,8 @@
 LOG_MODULE_REGISTER(zmk_esb_input_proc, CONFIG_ZMK_ESB_ENDPOINT_LOG_LEVEL);
 
 #define ESB_IP_MOTION_MAX_STALE_MS ((uint32_t)CONFIG_ZMK_ESB_ENDPOINT_MOTION_MAX_STALE_MS)
-
-/* Capacity of the per-instance button-edge queue used to defer reports
- * past a transport-quiet window. Sized for a press-and-release pair
- * with margin; further edges shift the oldest out so the final queued
- * state still matches d->buttons. */
-#define ESB_IP_PENDING_BTN_QUEUE 4u
-
-/* Retry cadence while waiting for esb_transport_is_quiet() to clear. */
-#define ESB_IP_QUIET_RETRY_MS 1u
+#define ESB_IP_PENDING_BTN_QUEUE   ((uint8_t)CONFIG_ZMK_ESB_ENDPOINT_IP_PENDING_BTN_QUEUE)
+#define ESB_IP_QUIET_RETRY_MS      ((uint32_t)CONFIG_ZMK_ESB_ENDPOINT_IP_QUIET_RETRY_MS)
 
 struct esb_ip_data {
     int32_t dx;
@@ -51,8 +46,8 @@ struct esb_ip_data {
     struct k_work_delayable retry_work;
 };
 
-static void send_hid_report_raw(uint8_t buttons, int32_t dx, int32_t dy,
-                                int32_t scroll_x, int32_t scroll_y) {
+static void send_hid_report_raw(const uint8_t buttons, const int32_t dx, const int32_t dy,
+                                const int32_t scroll_x, const int32_t scroll_y) {
     const struct zmk_hid_mouse_report_body body = {
         .buttons    = buttons,
         .d_x        = (int16_t)CLAMP(dx,       INT16_MIN, INT16_MAX),
@@ -123,7 +118,7 @@ static void retry_work_fn(struct k_work *work) {
     }
 }
 
-static void send_mouse_report(struct esb_ip_data *d, bool button_changed) {
+static void send_mouse_report(struct esb_ip_data *d, const bool button_changed) {
     /* Defer the send when either:
      *  - the transport is quiet (post-hop quiet, sync-TX side-trip): it
      *    will silently drop whatever we hand it, or

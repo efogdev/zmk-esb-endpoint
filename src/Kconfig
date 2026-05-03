@@ -150,12 +150,12 @@ config ESB_MAX_PAYLOAD_LENGTH
 
 config ESB_TX_FIFO_SIZE
     int "ESB TX FIFO depth"
-    default 64 if ZMK_ESB_ENDPOINT_SHELL_RELAY
+    default 32 if ZMK_ESB_ENDPOINT_SHELL_RELAY
     default 8
 
 config ESB_RX_FIFO_SIZE
     int "ESB RX FIFO depth"
-    default 32 if ZMK_ESB_ENDPOINT_SHELL_RELAY
+    default 24 if ZMK_ESB_ENDPOINT_SHELL_RELAY
     default 8
 
 config ESB_PIPE_COUNT
@@ -253,7 +253,7 @@ config ZMK_ESB_ENDPOINT_POINTER_RETRANSMIT_COUNT
 
 config ZMK_ESB_ENDPOINT_POINTER_MOTION_RING_SIZE
     int "Per-send motion record ring depth (pointer/scroll refund)"
-    default 16
+    default 24
     range 2 64
     help
       Capacity of the parallel ring that stores each recent mouse-report
@@ -266,7 +266,7 @@ config ZMK_ESB_ENDPOINT_POINTER_MOTION_RING_SIZE
 
 config ZMK_ESB_ENDPOINT_POINTER_REFUND_STALE_MS
     int "Drop accumulated pointer-refund deltas older than this (ms)"
-    default 32
+    default 100
     range 1 5000
     help
       Maximum age of pending pointer/scroll refund deltas before they
@@ -278,7 +278,7 @@ config ZMK_ESB_ENDPOINT_POINTER_REFUND_STALE_MS
 
 config ZMK_ESB_ENDPOINT_POINTER_INFLIGHT_CAP
     int "Maximum in-flight pointer-motion HID reports queued to ESB"
-    default 3
+    default 5
     range 1 32
     help
       Cap on the number of mouse motion HID reports that may be sitting
@@ -331,6 +331,20 @@ config ZMK_ESB_ENDPOINT_CRITICAL_RETRANSMIT_COUNT
       ceiling is 15. Lowering this trades robustness for shorter
       worst-case TX-drain windows (each retransmit consumes
       RETRANSMIT_DELAY_US microseconds of air time on failure).
+
+config ZMK_ESB_ENDPOINT_CRIT_OVERRIDE_RING_SIZE
+    int "Critical-override per-send ring depth"
+    depends on ZMK_ESB_ENDPOINT_CRITICAL_MAX_RETRANSMIT
+    default 8
+    range 2 64
+    help
+      Capacity of the parallel ring tracking which recent sends pushed the
+      radio's retransmit_count to CRITICAL_RETRANSMIT_COUNT, so the matching
+      TX event can restore the steady-state value. Sized like the other
+      per-send rings; should comfortably exceed the typical number of
+      in-flight critical packets in ESB's TX FIFO. MUST be a power of two
+      (the index path uses `& (SIZE - 1)`); a BUILD_ASSERT in
+      esb_transport.c enforces this at compile time.
 
 config ZMK_ESB_ENDPOINT_BEACON_INTERVAL_MS
     int "Pairing beacon interval (milliseconds)"
@@ -393,7 +407,7 @@ config ZMK_ESB_ENDPOINT_CTRL_MSGQ_DEPTH
 
 config ZMK_ESB_ENDPOINT_TX_FAIL_WARN_THRESHOLD
     int "Consecutive TX failures before warning log"
-    default 1
+    default 3
     range 1 100
 
 config ZMK_ESB_ENDPOINT_TX_FAIL_ERR_THRESHOLD
@@ -435,6 +449,30 @@ config ZMK_ESB_ENDPOINT_HID_QUIET_RETRY_MS
       replay latency once the window ends — each pending snapshot lands
       within this many ms of quiet ending. Lower values trade a tiny
       bit of workqueue load for tighter replay timing.
+
+config ZMK_ESB_ENDPOINT_IP_PENDING_BTN_QUEUE
+    int "Input-processor pending button-edge queue depth"
+    default 4
+    range 1 32
+    help
+      Per-instance ring depth for mouse-button edges that fall during a
+      transport-quiet window or while pointer back-pressure is active.
+      Drained in order once the deferral condition clears so the host
+      sees each press/release. Sized for a press+release pair with
+      margin; on overrun the oldest entry is shifted out so the queue
+      still ends on the latest state. Mirror of HID_QUIET_KB_QUEUE_DEPTH
+      for the input processor side.
+
+config ZMK_ESB_ENDPOINT_IP_QUIET_RETRY_MS
+    int "Input-processor quiet-drain poll cadence (ms)"
+    default 1
+    range 1 50
+    help
+      Cadence at which the input processor's retry worker re-checks
+      esb_transport_is_quiet() / esb_transport_pointer_backpressure()
+      while either signal is set. Drives motion + queued button-edge
+      replay latency once the deferral condition clears. Mirror of
+      HID_QUIET_RETRY_MS for the input processor side.
 
 config ZMK_ESB_ENDPOINT_CHANNEL_HOP
     bool "Dynamic channel hopping on TX failure"
@@ -673,6 +711,19 @@ config ZMK_ESB_ENDPOINT_LINK_QUALITY_WINDOW
       register. Each bit is 1 if event->tx_attempts > 1 (i.e. at least
       one ESB retransmit was needed). Used by the cooperative-hop
       trigger and exposed for shell observability.
+
+config ZMK_ESB_ENDPOINT_LINK_QUALITY_NOACK_RING_SIZE
+    int "Link-quality noack-tracking ring depth"
+    default 8
+    range 2 64
+    help
+      Capacity of the parallel ring that records the noack flag of each
+      recent send so the matching TX event can decide whether to feed the
+      link-quality popcount/EWMA. Noack events report tx_attempts=1
+      unconditionally and would dilute the signal. Sized like the other
+      per-send rings. MUST be a power of two (the index path uses
+      `& (SIZE - 1)`); a BUILD_ASSERT in esb_transport.c enforces this at
+      compile time.
 
 config ZMK_ESB_ENDPOINT_LINK_DEGRADED_THRESHOLD
     int "Cooperative-hop trigger: retried packets in window"
