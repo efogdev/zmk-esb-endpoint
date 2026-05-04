@@ -60,7 +60,7 @@ stored one via a `VERIFY_REQ` / `VERIFY_RESP` exchange. A stranger dongle
 (or a stale mismatched record) logs a warning and never flips to
 CONNECTED, so input can't leak to the wrong host.
 
-## Dongle
+## Dongle ([example firmware](https://github.com/efogtech/endgame-trackball-firmware/tree/main/dongle-1k-firmware))
 
 You bring your own PRX. The wire protocol is in `include/zmk_esb/protocol.h`.
 Core HID path is five message types (`BEACON` / `PAIR_REQ` / `PAIR_RESP` /
