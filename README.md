@@ -252,15 +252,7 @@ and the module will not just build and run on anything else without edits:
 - HFXO is held for the lifetime of the ESB slot so the LFRC calibrator
   doesn't stop HFCLK out from under an in-flight packet.
 
-**nRF52840 should work with modifications.** Start by:
-
-- Reviewing the PPI mask against your LL build.
-- Checking `NVIC_NUM_VECTORS` — the 52840 is also 48 external so this
-  happens to match, but verify.
-- Making sure no other subsystem on your board is already using `TIMER2`.
-- Confirming the `--wrap=bt_le_adv_*` symbol names still exist in the
-  host version you're linking against (`bt_le_adv_start`,
-  `bt_le_adv_update_data`, `bt_le_adv_start_legacy`).
+**nRF52840 should work but I'm not sure.** Review the PPI mask against your LL build.
 
 ## Worth knowing
 
