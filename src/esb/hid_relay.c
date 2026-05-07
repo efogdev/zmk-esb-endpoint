@@ -136,33 +136,27 @@ static void cons_keys_release(const uint32_t keycode) {
     }
 }
 
-static void send_kb_body(const struct zmk_hid_keyboard_report_body *body) {
+static int send_hid_pkt(uint8_t report_type, const void *body, size_t body_len) {
     struct esb_pkt_hid_report pkt = {
         .type        = ESB_PKT_HID_REPORT,
-        .report_type = ESB_REPORT_KEYBOARD,
+        .report_type = report_type,
     };
-    size_t body_len = sizeof(*body);
     if (body_len > sizeof(pkt.data)) {
         body_len = sizeof(pkt.data);
     }
     memcpy(pkt.data, body, body_len);
-    const int err = esb_transport_send(ESB_PIPE_DATA, (uint8_t *)&pkt, sizeof(pkt));
+    return esb_transport_send(ESB_PIPE_DATA, (uint8_t *)&pkt, sizeof(pkt));
+}
+
+static void send_kb_body(const struct zmk_hid_keyboard_report_body *body) {
+    const int err = send_hid_pkt(ESB_REPORT_KEYBOARD, body, sizeof(*body));
     if (err && err != -ENOMEM) {
         LOG_WRN("KB report send err %d", err);
     }
 }
 
 static void send_cons_body(const struct zmk_hid_consumer_report_body *body) {
-    struct esb_pkt_hid_report pkt = {
-        .type        = ESB_PKT_HID_REPORT,
-        .report_type = ESB_REPORT_CONSUMER,
-    };
-    size_t body_len = sizeof(*body);
-    if (body_len > sizeof(pkt.data)) {
-        body_len = sizeof(pkt.data);
-    }
-    memcpy(pkt.data, body, body_len);
-    const int err = esb_transport_send(ESB_PIPE_DATA, (uint8_t *)&pkt, sizeof(pkt));
+    const int err = send_hid_pkt(ESB_REPORT_CONSUMER, body, sizeof(*body));
     if (err && err != -ENOMEM) {
         LOG_WRN("consumer report send err %d", err);
     }
