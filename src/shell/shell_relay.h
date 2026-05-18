@@ -9,6 +9,8 @@
 #include <stdint.h>
 
 void esb_shell_relay_init(void);
+void esb_shell_relay_on_activate(void);
+void esb_shell_relay_on_deactivate(void);
 void esb_shell_relay_on_connected(void);
 void esb_shell_relay_on_disconnected(void);
 void esb_shell_relay_on_req(void);

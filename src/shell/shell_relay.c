@@ -326,13 +326,22 @@ static int esb_stdout_hook(const int c) {
 }
 
 void esb_shell_relay_init(void) {
-    __stdout_hook_install(esb_stdout_hook);
     k_work_queue_init(&shell_exec_q);
     k_work_queue_start(&shell_exec_q, shell_exec_stack,
                        K_THREAD_STACK_SIZEOF(shell_exec_stack),
                        K_PRIO_PREEMPT(CONFIG_ZMK_ESB_ENDPOINT_SHELL_EXEC_PRIORITY),
                        NULL);
     k_thread_name_set(&shell_exec_q.thread, "esb_shell_exec");
+}
+
+void esb_shell_relay_on_activate(void) {
+    if (zmk_esb_endpoint_is_active()) {
+        __stdout_hook_install(esb_stdout_hook);
+    }
+}
+
+void esb_shell_relay_on_deactivate(void) {
+    __stdout_hook_install(NULL);
 }
 
 void esb_shell_relay_on_connected(void) {

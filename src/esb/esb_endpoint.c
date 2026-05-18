@@ -185,7 +185,13 @@ static void esb_ctrl_thread_fn(void *p1, void *p2, void *p3) {
 #if IS_ENABLED(CONFIG_ZMK_ADAPTIVE_FEEDBACK)
             zaf_custom_event_trigger(&esb_switched_to_dongle);
 #endif
+#if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_SHELL_RELAY)
+            esb_shell_relay_on_activate();
+#endif
         } else if (cmd == ESB_CMD_DEACTIVATE) {
+#if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_SHELL_RELAY)
+            esb_shell_relay_on_deactivate();
+#endif
             esb_active = false;
             esb_transport_on_slot_stop();
             pairing_stop();
