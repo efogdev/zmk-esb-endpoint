@@ -18,13 +18,11 @@
  */
 
 #include <zephyr/kernel.h>
-#include <zephyr/shell/shell.h>
-#include <zephyr/shell/shell_dummy.h>
-#include <zephyr/sys/ring_buffer.h>
 #include <string.h>
 
 #include <zmk_esb/protocol.h>
 #include <zmk_esb/endpoint.h>
+#include <zmk_shell_relay/relay.h>
 #include "esb_transport.h"
 #include "shell_relay.h"
 
@@ -39,8 +37,6 @@ static bool m_shell_active;
 static char cmd_buf[CONFIG_ZMK_ESB_ENDPOINT_SHELL_CMD_BUF_SIZE];
 static size_t cmd_len;
 static K_MUTEX_DEFINE(cmd_mutex);
-
-RING_BUF_DECLARE(out_rb, CONFIG_ZMK_ESB_ENDPOINT_SHELL_OUT_BUF_SIZE);
 
 static void shell_exec_work_fn(struct k_work *w);
 static void shell_poll_work_fn(struct k_work *w);
@@ -70,30 +66,19 @@ static uint8_t stdout_buf[CONFIG_ZMK_ESB_ENDPOINT_SHELL_STDOUT_COALESCE_BYTES];
 static size_t stdout_buf_len;
 static struct k_spinlock stdout_buf_lock;
 
-/* Dedicated work queue for shell_exec_work. Keeps long-running NVS-bound
- * commands (e.g. settings_load_subtree_direct) off the system workqueue so
- * shell_poll_work / out_drain_work / radio housekeeping keep firing while a
- * command runs, and gives shell_execute_cmd enough stack to absorb VLA-using
- * settings callbacks that overflow the system workqueue's 1 KB default. */
-static K_THREAD_STACK_DEFINE(shell_exec_stack,
-                             CONFIG_ZMK_ESB_ENDPOINT_SHELL_EXEC_STACK_SIZE);
-static struct k_work_q shell_exec_q;
-
 /* Tracks the column the dongle's CDC cursor will be on after the bytes
- * currently queued in out_rb are flushed. Used to decide whether a log
- * message needs a leading CRLF to escape the prompt or mid-typed input.
- * Only reflects what the keyboard has emitted — the dongle's local input
- * echo is not visible here, so this is best-effort. */
+ * currently queued in the relay output buffer are flushed. Used to decide
+ * whether a log message needs a leading CRLF to escape the prompt or
+ * mid-typed input. Only reflects what the keyboard has emitted — the dongle's
+ * local input echo is not visible here, so this is best-effort. */
 static bool m_at_line_start = true;
 
 static void out_enqueue(const uint8_t *data, const size_t len) {
-    const uint32_t put = ring_buf_put(&out_rb, data, (uint32_t)len);
-    if (put < len) {
-        LOG_WRN("out_rb full: dropped %zu bytes", len - put);
+    if (len == 0) {
+        return;
     }
-    if (put > 0) {
-        m_at_line_start = (data[put - 1] == '\n');
-    }
+    zmk_shell_relay_enqueue(data, len);
+    m_at_line_start = (data[len - 1] == '\n');
 }
 
 static const char newline[] = "\r\n";
@@ -114,7 +99,7 @@ static void out_drain_work_fn(struct k_work *w) {
     uint32_t got;
     uint32_t sent = 0;
 
-    while ((got = ring_buf_get_claim(&out_rb, &chunk, ESB_PKT_DATA_MAX)) > 0) {
+    while ((got = zmk_shell_relay_claim(&chunk, ESB_PKT_DATA_MAX)) > 0) {
         struct esb_pkt_shell_data pkt = {
             .type = ESB_PKT_SHELL_DATA,
             .len  = (uint8_t)got,
@@ -125,14 +110,14 @@ static void out_drain_work_fn(struct k_work *w) {
         const int err = esb_transport_send(ESB_PIPE_DATA, (uint8_t *)&pkt, sizeof(pkt));
         if (err == -ENOMEM) {
             LOG_DBG("shell TX FIFO full, %u bytes deferred", got);
-            ring_buf_get_finish(&out_rb, 0);
+            zmk_shell_relay_finish(0);
             break;
         } else if (err) {
             LOG_WRN("shell TX err %d, dropping %u bytes", err, got);
-            ring_buf_get_finish(&out_rb, got);
+            zmk_shell_relay_finish(got);
             break;
         }
-        ring_buf_get_finish(&out_rb, got);
+        zmk_shell_relay_finish(got);
         sent += got;
     }
 
@@ -161,27 +146,9 @@ static void shell_exec_work_fn(struct k_work *w) {
     *end = '\0';
 
     LOG_DBG("exec '%s'", start);
-
-    const struct shell *sh = shell_backend_dummy_get_ptr();
-    shell_backend_dummy_clear_output(sh);
-    const int ret = shell_execute_cmd(sh, start);
-
-    size_t out_len;
-    const char *out = shell_backend_dummy_get_output(sh, &out_len);
-
-    LOG_DBG("ret=%d out_len=%zu", ret, out_len);
-    if (ret == -ENOEXEC) {
-        char msg[CONFIG_ZMK_ESB_ENDPOINT_SHELL_CMD_BUF_SIZE + 32];
-        const int n = snprintk(msg, sizeof(msg), "\r\n\033[31m%s: command not found\033[0m", start);
-        if (n > 0) {
-            out_enqueue((const uint8_t *)msg, (size_t)n);
-        }
-    } else {
-        if (out_len > 0) {
-            out_enqueue((const uint8_t *)out, out_len);
-        }
-    }
-
+    const int ret = zmk_shell_relay_execute(start);
+    LOG_DBG("ret=%d", ret);
+    k_sleep(K_MSEC(10));
     send_prompt();
 }
 
@@ -200,12 +167,12 @@ static void shell_poll_work_fn(struct k_work *w) {
 
 static void inactivity_work_fn(struct k_work *w) {
     ARG_UNUSED(w);
-    LOG_DBG("inactivity timeout (%ds), stopping",
-            CONFIG_ZMK_ESB_ENDPOINT_SHELL_INACTIVITY_S);
+    LOG_DBG("inactivity timeout (%ds), stopping", CONFIG_ZMK_ESB_ENDPOINT_SHELL_INACTIVITY_S);
     m_shell_active = false;
     k_work_cancel_delayable(&shell_poll_work);
     stdout_buf_reset();
-    ring_buf_reset(&out_rb);
+    zmk_shell_relay_detach();
+    zmk_shell_relay_reset();
     struct esb_pkt_shell_stop pkt = { .type = ESB_PKT_SHELL_STOP };
     esb_transport_send(ESB_PIPE_DATA, (uint8_t *)&pkt, sizeof(pkt));
 }
@@ -320,18 +287,19 @@ static int esb_stdout_hook(const int c) {
     }
     full = (stdout_buf_len >= sizeof(stdout_buf));
     k_spin_unlock(&stdout_buf_lock, key);
-    k_work_reschedule(&stdout_flush_work,
-                      full ? K_NO_WAIT : K_MSEC(CONFIG_ZMK_ESB_ENDPOINT_SHELL_STDOUT_COALESCE_MS));
+    k_work_reschedule(&stdout_flush_work, full ? K_NO_WAIT : K_MSEC(CONFIG_ZMK_ESB_ENDPOINT_SHELL_STDOUT_COALESCE_MS));
     return c;
 }
 
+static void esb_out_data_ready(void) {
+    k_work_submit(&out_drain_work);
+}
+
+static const struct zmk_shell_relay_sink esb_shell_sink = {
+    .data_ready = esb_out_data_ready,
+};
+
 void esb_shell_relay_init(void) {
-    k_work_queue_init(&shell_exec_q);
-    k_work_queue_start(&shell_exec_q, shell_exec_stack,
-                       K_THREAD_STACK_SIZEOF(shell_exec_stack),
-                       K_PRIO_PREEMPT(CONFIG_ZMK_ESB_ENDPOINT_SHELL_EXEC_PRIORITY),
-                       NULL);
-    k_thread_name_set(&shell_exec_q.thread, "esb_shell_exec");
 }
 
 void esb_shell_relay_on_activate(void) {
@@ -350,7 +318,8 @@ void esb_shell_relay_on_connected(void) {
     k_work_cancel_delayable(&shell_poll_work);
     k_work_cancel_delayable(&inactivity_work);
     stdout_buf_reset();
-    ring_buf_reset(&out_rb);
+    zmk_shell_relay_detach();
+    zmk_shell_relay_reset();
     k_mutex_lock(&cmd_mutex, K_FOREVER);
     cmd_len = 0;
     k_mutex_unlock(&cmd_mutex);
@@ -371,7 +340,8 @@ void esb_shell_relay_on_disconnected(void) {
     k_work_cancel_delayable(&shell_poll_work);
     k_work_cancel_delayable(&inactivity_work);
     stdout_buf_reset();
-    ring_buf_reset(&out_rb);
+    zmk_shell_relay_detach();
+    zmk_shell_relay_reset();
 }
 
 void esb_shell_relay_on_req(void) {
@@ -383,7 +353,8 @@ void esb_shell_relay_on_req(void) {
     m_shell_active = true;
     cmd_len = 0;
     stdout_buf_reset();
-    ring_buf_reset(&out_rb);
+    zmk_shell_relay_reset();
+    zmk_shell_relay_attach(&esb_shell_sink);
 #if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_SHELL_BG_POLL)
     k_work_cancel_delayable(&bg_poll_work);
 #endif
@@ -428,7 +399,7 @@ void esb_shell_relay_on_data(const uint8_t *data, const uint8_t len) {
                 cmd_len = 0;
                 k_mutex_unlock(&cmd_mutex);
                 LOG_DBG("command ready, submitting exec work");
-                k_work_submit_to_queue(&shell_exec_q, &shell_exec_work);
+                zmk_shell_relay_submit_exec(&shell_exec_work);
                 k_mutex_lock(&cmd_mutex, K_FOREVER);
             }
         } else if (b == 0x7F || b == 0x08) {
@@ -455,8 +426,8 @@ bool esb_shell_relay_is_active(void) {
 }
 
 void esb_shell_relay_notify_tx(void) {
-    if (m_shell_active && ring_buf_size_get(&out_rb) > 0) {
-        LOG_DBG("notify_tx, %u bytes pending", ring_buf_size_get(&out_rb));
+    if (m_shell_active && zmk_shell_relay_size() > 0) {
+        LOG_DBG("notify_tx, %u bytes pending", zmk_shell_relay_size());
         k_work_submit(&out_drain_work);
     }
 }

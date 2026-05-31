@@ -114,6 +114,11 @@ session is already open. Enabled by default with the shell relay
 
 ## Shell relay (optional)
 
+> [!IMPORTANT]
+> The shell relay needs the [`zmk-shell-relay-core`](https://github.com/efogdev/zmk-shell-relay-core)
+> module present in your `west.yml`. It owns the shared internal shell
+> instance and output buffer; without it the relay will not build.
+
 `CONFIG_ZMK_ESB_ENDPOINT_SHELL_RELAY=y` turns the link into a bidirectional
 Zephyr shell transport: the dongle requests a session (`SHELL_REQ` via ACK
 payload), the keyboard executes commands through the dummy shell backend
