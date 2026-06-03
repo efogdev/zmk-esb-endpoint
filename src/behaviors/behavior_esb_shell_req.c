@@ -30,6 +30,9 @@ static int behavior_esb_shell_req_init(const struct device *dev) {
 
 static const struct behavior_driver_api behavior_esb_shell_req_driver_api = {
     .binding_pressed = on_keymap_binding_pressed,
+#if IS_ENABLED(CONFIG_ZMK_BEHAVIOR_METADATA)
+    .get_parameter_metadata = zmk_behavior_get_empty_param_metadata,
+#endif // IS_ENABLED(CONFIG_ZMK_BEHAVIOR_METADATA)
 };
 
 #define ESB_SHELL_REQ_INST(n)                                                                      \
