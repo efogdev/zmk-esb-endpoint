@@ -59,6 +59,9 @@ LOG_MODULE_REGISTER(esb, CONFIG_ESB_LOG_LEVEL);
 /* Radio Rx ramp-up time in microseconds. */
 #define RX_RAMP_UP_TIME_US 124
 
+/* Upper bound on the radio DISABLE ramp-down poll in esb_stop_tx(). */
+#define STOP_TX_DISABLE_TIMEOUT_US 940
+
 /* Interrupt flags */
 /* Interrupt mask value for TX success. */
 #define INT_TX_SUCCESS_MSK BIT(0)
@@ -2207,6 +2210,47 @@ int esb_stop_rx(void)
 
 	esb_state = ESB_STATE_IDLE;
 	errata216_off();
+
+	return 0;
+}
+
+int esb_stop_tx(void)
+{
+	if (esb_state == ESB_STATE_IDLE) {
+		return 0;
+	}
+
+	if (esb_cfg.mode != ESB_MODE_PTX) {
+		return -EINVAL;
+	}
+
+	const unsigned int key = irq_lock();
+
+	esb_ppi_for_txrx_clear(false, false);
+	esb_fem_reset();
+
+	nrf_radio_shorts_disable(NRF_RADIO, 0xFFFFFFFF);
+	nrf_radio_int_disable(NRF_RADIO, 0xFFFFFFFF);
+
+	on_radio_disabled = NULL;
+
+	nrf_radio_event_clear(NRF_RADIO, NRF_RADIO_EVENT_DISABLED);
+	nrf_radio_task_trigger(NRF_RADIO, NRF_RADIO_TASK_DISABLE);
+
+	const uint32_t start = k_cycle_get_32();
+	const uint32_t budget = k_us_to_cyc_ceil32(STOP_TX_DISABLE_TIMEOUT_US);
+	while (!nrf_radio_event_check(NRF_RADIO, NRF_RADIO_EVENT_DISABLED)) {
+		if ((k_cycle_get_32() - start) >= budget) {
+			break;  /* radio already settled; avoid a wedged spin */
+		}
+	}
+
+	nrf_radio_event_clear(NRF_RADIO, NRF_RADIO_EVENT_DISABLED);
+
+	esb_state = ESB_STATE_IDLE;
+	errata216_off();
+
+	irq_unlock(key);
 
 	return 0;
 }

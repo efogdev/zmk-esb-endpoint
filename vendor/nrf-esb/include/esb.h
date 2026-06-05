@@ -438,6 +438,19 @@ int esb_start_rx(void);
  */
 int esb_stop_rx(void);
 
+/** @brief Force a PTX radio to the idle state.
+ *
+ *  Aborts any in-flight transmission and brings the radio to
+ *  ESB_STATE_IDLE without tearing the module down (queues and
+ *  initialization are preserved). Needed so esb_set_rf_channel() can run
+ *  when CONFIG_ESB_NEVER_DISABLE_TX keeps the radio hot between sends.
+ *  The next esb_write_payload() re-ramps the radio via start_tx_transaction.
+ *
+ * @retval 0 If successful (including when already idle).
+ *           Otherwise, a (negative) error code is returned.
+ */
+int esb_stop_tx(void);
+
 /** @brief Flush the TX buffer.
  *
  * This function clears the TX FIFO buffer.

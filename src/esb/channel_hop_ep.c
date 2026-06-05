@@ -144,6 +144,14 @@ static volatile uint32_t m_last_link_event_ms;
  * path and target the rendezvous channel directly. Single-bit flag, single
  * producer (ISR), single consumer (workqueue) — no lock. */
 static volatile bool m_rendezvous_fallback_pending;
+
+/* Uptime (ms, wrap-safe) until which TX-fail hops are suppressed while the
+ * endpoint sits on the rendezvous channel after a fallback. Keeps the
+ * endpoint a stationary target for the dongle's rollback dwell instead of
+ * bouncing away after one cooldown. Cleared to 0 by the first TX_SUCCESS
+ * (re-acquired) and on init / disconnect; otherwise it simply expires and
+ * normal hopping resumes. Zero means "not holding". */
+static volatile uint32_t m_rendezvous_hold_until;
 #endif
 
 #if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_COOP_HOP)
@@ -683,6 +691,16 @@ static void hop_work_fn(struct k_work *w) {
             m_last_link_event_ms = (now == 0) ? 1 : now;
         }
         start_post_hop_burst();
+#if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_RENDEZVOUS)
+        /* Park here: suppress hops until a TX_SUCCESS re-acquires the link
+         * or the hold expires, so the dongle's rollback dwell has a
+         * stationary target instead of a moving one. */
+        if (CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_HOP_RENDEZVOUS_HOLD_MS > 0) {
+            const uint32_t hold = k_uptime_get_32() +
+                CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_HOP_RENDEZVOUS_HOLD_MS;
+            m_rendezvous_hold_until = (hold == 0) ? 1 : hold;
+        }
+#endif
         k_work_reschedule(&negotiate_work,
                           K_MSEC(CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_HOP_NEGOTIATE_RETRY_MS));
         return;
@@ -857,6 +875,7 @@ void channel_hop_ep_init(void) {
     m_last_link_event_ms = 0;
 #if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_RENDEZVOUS)
     m_rendezvous_fallback_pending = false;
+    m_rendezvous_hold_until = 0;
 #endif
     m_request_burst_remaining = 0;
 #if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_COOP_HOP)
@@ -896,6 +915,7 @@ void channel_hop_ep_on_disconnected(void) {
     m_last_link_event_ms = 0;
 #if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_RENDEZVOUS)
     m_rendezvous_fallback_pending = false;
+    m_rendezvous_hold_until = 0;
 #endif
     m_request_burst_remaining = 0;
 #if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_COOP_HOP)
@@ -1060,6 +1080,18 @@ void channel_hop_ep_on_tx_fail_isr(void) {
     if (!m_active) {
         return;
     }
+#if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_RENDEZVOUS)
+    /* Parked on the rendezvous channel after a fallback: hold here with all
+     * hops suppressed so the dongle's rollback dwell can re-acquire a
+     * stationary target. Cleared by TX_SUCCESS; otherwise expires so a dead
+     * rendezvous channel is not a permanent trap. */
+    if (m_rendezvous_hold_until != 0) {
+        if ((int32_t)(m_rendezvous_hold_until - k_uptime_get_32()) > 0) {
+            return;
+        }
+        m_rendezvous_hold_until = 0;
+    }
+#endif
     /* Post-hop cooldown: after a recent hop, give the dongle time to fire
      * its own silence watchdog (RX_SILENCE_MS) and validate the speculative
      * hop (VALIDATE_MS) before we consider hopping again. Without this a
@@ -1114,6 +1146,10 @@ void channel_hop_ep_on_tx_success_isr(void) {
     /* A packet made it through on the current channel — any pending
      * "revert to the previous channel" arming is no longer appropriate. */
     m_prev_channel = CHANNEL_HOP_INVALID;
+#if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_RENDEZVOUS)
+    /* Link re-acquired — end any rendezvous hold so normal hopping resumes. */
+    m_rendezvous_hold_until = 0;
+#endif
     /* Refresh the silence clock rather than clearing it. If the link goes
      * dead again inside the same cooldown window, the fallback must still
      * be able to fire after RENDEZVOUS_FALLBACK_MS of fresh silence. */

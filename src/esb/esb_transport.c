@@ -100,9 +100,14 @@ static volatile bool   m_sync_tx_in_progress;
 static volatile bool   m_sync_tx_result_success;
 #endif
 
+/* Double-buffered RX mailbox. The EGU event ISR fills the inactive slot and
+ * publishes it by flipping rx_active; rx_work_fn reads the published slot.
+ * The ISR never writes the slot the consumer just snapshotted, so a torn read
+ * needs two ISR events inside one rx_work_fn pass rather than any overlap. */
 static struct k_work rx_work;
-static uint8_t rx_buf[ESB_MAX_PAYLOAD_LEN];
-static uint8_t rx_len;
+static uint8_t rx_buf[2][ESB_MAX_PAYLOAD_LEN];
+static uint8_t rx_len[2];
+static volatile uint8_t rx_active;
 
 static uint32_t tx_ok_count;
 static uint32_t tx_fail_count;
@@ -373,10 +378,11 @@ static void rx_work_fn(struct k_work *w) {
         return;
     }
     note_activity();
+    const uint8_t slot = rx_active;
     const esb_transport_evt_t evt = {
         .type   = ESB_RX_EVT,
-        .rx_buf = rx_buf,
-        .rx_len = rx_len,
+        .rx_buf = rx_buf[slot],
+        .rx_len = rx_len[slot],
     };
     m_cb(&evt);
 }
@@ -808,8 +814,10 @@ static void zmk_esb_transport_evt_cb(struct esb_evt const *event) {
         while (esb_read_rx_payload(&m_rx_payload) == 0) {
             if (m_rx_payload.length > 0 &&
                 m_rx_payload.length <= ESB_MAX_PAYLOAD_LEN) {
-                rx_len = m_rx_payload.length;
-                memcpy(rx_buf, m_rx_payload.data, rx_len);
+                const uint8_t slot = rx_active ^ 1U;
+                rx_len[slot] = m_rx_payload.length;
+                memcpy(rx_buf[slot], m_rx_payload.data, rx_len[slot]);
+                rx_active = slot;
                 k_work_submit(&rx_work);
             }
         }
@@ -1044,6 +1052,16 @@ int esb_transport_set_channel(const uint8_t channel) {
      * critical- or pointer-override packet that got dropped by the flush
      * does not strand the radio at the override value. */
     esb_flush_tx_and_reset();
+
+    /* esb_set_rf_channel() requires ESB_STATE_IDLE. With
+     * CONFIG_ESB_NEVER_DISABLE_TX the radio stays hot (PTX_TXIDLE / mid
+     * TX-ACK) after the flush and, under sustained traffic, never falls
+     * back to IDLE on its own — so the hop would fail -EBUSY on every
+     * attempt. Force the radio idle here (the flush already dropped the
+     * queue; the next esb_transport_send re-ramps on the new channel via
+     * start_tx_transaction). The DISABLED settle is a hardware wait of a
+     * few microseconds, not a queue-blocking sleep. */
+    esb_stop_tx();
     const int err = esb_set_rf_channel(channel);
     if (err) {
         return err;
