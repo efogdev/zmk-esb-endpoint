@@ -16,12 +16,32 @@
 #define CHANNEL_HOP_CHANNEL_COUNT 101
 #define CHANNEL_HOP_INVALID 0xFF
 
+#if defined(CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_QUARANTINE_PERSIST)
+/* Persisted set of "worst offender" channels the picker avoids. The
+ * endpoint owns a hit-count table that accumulates evidence of bad
+ * channels and periodically distils the top N into this set (and to NVS);
+ * see channel_hop_ep.c. Members are hard-excluded from selection and
+ * buffered at half the timed-quarantine min_distance. channels[0..count)
+ * hold the avoided channel ids. The array is sized by the Kconfig N. */
+struct persistent_quarantine {
+    uint8_t channels[CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_QUARANTINE_PERSIST_SIZE];
+    uint8_t count;
+};
+#endif
+
 struct quarantine_state {
     /* expires_at[ch] == uptime (ms) at which quarantine on channel ch ends.
      * Zero means "never quarantined". Channel ch is quarantined iff
      * expires_at[ch] > k_uptime_get_32(). */
     uint32_t expires_at[CHANNEL_HOP_CHANNEL_COUNT];
+#if defined(CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_QUARANTINE_PERSIST)
+    struct persistent_quarantine persistent;
+#endif
 };
+
+#if defined(CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_QUARANTINE_PERSIST)
+bool persistent_quarantine_contains(const struct persistent_quarantine *p, uint8_t channel);
+#endif
 
 void quarantine_reset(struct quarantine_state *q);
 

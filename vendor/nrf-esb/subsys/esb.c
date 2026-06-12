@@ -2226,7 +2226,18 @@ int esb_stop_tx(void)
 
 	const unsigned int key = irq_lock();
 
+	nrf_timer_task_trigger(esb_timer.p_reg, NRF_TIMER_TASK_STOP);
+	nrf_timer_task_trigger(esb_timer.p_reg, NRF_TIMER_TASK_CLEAR);
+	nrf_timer_int_disable(esb_timer.p_reg,
+			      nrf_timer_compare_int_get(NRF_TIMER_CC_CHANNEL1));
+	nrf_timer_event_clear(esb_timer.p_reg, NRF_TIMER_EVENT_COMPARE0);
+	nrf_timer_event_clear(esb_timer.p_reg, NRF_TIMER_EVENT_COMPARE1);
+	on_timer_compare1 = NULL;
+
 	esb_ppi_for_txrx_clear(false, false);
+	esb_ppi_for_retransmission_clear();
+	esb_ppi_for_wait_for_ack_clear();
+	esb_ppi_for_wait_for_rx_clear();
 	esb_fem_reset();
 
 	nrf_radio_shorts_disable(NRF_RADIO, 0xFFFFFFFF);

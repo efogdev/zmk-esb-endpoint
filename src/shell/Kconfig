@@ -34,7 +34,7 @@ config ZMK_ESB_ENDPOINT_SHELL_CMD_BUF_SIZE
 
 config ZMK_ESB_ENDPOINT_SHELL_STDOUT_COALESCE_BYTES
     int "stdout hook coalescing buffer size (bytes)"
-    default 32
+    default 96
     range 16 256
     depends on ZMK_ESB_ENDPOINT_SHELL_RELAY
     help

@@ -238,6 +238,13 @@ static uint32_t m_first_fail_ms;
  * single-word Cortex-M access so no lock needed (same as m_first_fail_ms). */
 static uint32_t m_last_tx_success_ms;
 
+/* Consecutive -EBUSY results from esb_set_rf_channel() across hop
+ * attempts. Forcing the radio idle aborts an in-flight TX cycle, so the
+ * hop path first lets the retry worker wait out transient busyness and
+ * only stops TX once the streak shows the radio is not draining to IDLE
+ * on its own. */
+static uint8_t m_set_channel_busy_streak;
+
 /* Post-hop quiet window deadline. Set by esb_transport_set_channel();
  * esb_transport_send() silently drops packets while now < deadline so
  * the dongle has time to follow the speculative hop before we pile on
@@ -475,11 +482,13 @@ static void adaptive_retry_work_fn(struct k_work *work) {
     ARG_UNUSED(work);
     const uint8_t want = adaptive_retry_target();
     if (want != m_adaptive_retransmit_count) {
+        k_sched_lock();
         if (esb_set_retransmit_count(want) == 0) {
             m_adaptive_retransmit_count = want;
             LOG_DBG("adaptive retry: ewma_x10=%u -> count=%u",
                     m_link_quality_ewma_x10, want);
         }
+        k_sched_unlock();
     }
     k_work_reschedule(&m_adaptive_retry_work,
                       K_MSEC(CONFIG_ZMK_ESB_ENDPOINT_ADAPTIVE_RETRY_INTERVAL_MS));
@@ -715,7 +724,9 @@ void esb_transport_flush_tx(void) {
         k_sleep(K_MSEC(1));
     }
 #endif
+    k_sched_lock();
     esb_flush_tx_and_reset();
+    k_sched_unlock();
 }
 
 static void zmk_esb_transport_evt_cb(struct esb_evt const *event) {
@@ -1035,6 +1046,11 @@ int esb_transport_set_channel(const uint8_t channel) {
     if (!m_addr.configured) {
         return -ENODEV;
     }
+    /* The flush → (stop) → retune → bookkeeping sequence must not
+     * interleave with a concurrent esb_transport_send from another
+     * thread, which would re-arm the radio on the old channel mid-hop. */
+    k_sched_lock();
+
     /* Force an LFRC calibration on every hop. The persistent HFXO hold
      * (see hfxo_request) keeps the 32M xtal running, but the LFRC itself
      * still drifts with temperature between the calibrator's 8s hw-cal
@@ -1054,16 +1070,25 @@ int esb_transport_set_channel(const uint8_t channel) {
     esb_flush_tx_and_reset();
 
     /* esb_set_rf_channel() requires ESB_STATE_IDLE. With
-     * CONFIG_ESB_NEVER_DISABLE_TX the radio stays hot (PTX_TXIDLE / mid
-     * TX-ACK) after the flush and, under sustained traffic, never falls
-     * back to IDLE on its own — so the hop would fail -EBUSY on every
-     * attempt. Force the radio idle here (the flush already dropped the
-     * queue; the next esb_transport_send re-ramps on the new channel via
-     * start_tx_transaction). The DISABLED settle is a hardware wait of a
-     * few microseconds, not a queue-blocking sleep. */
-    esb_stop_tx();
-    const int err = esb_set_rf_channel(channel);
+     * CONFIG_ESB_NEVER_DISABLE_TX the radio can stay hot (PTX_TXIDLE /
+     * mid TX-ACK) indefinitely under sustained traffic, so -EBUSY may
+     * never clear on its own. Stopping TX outright takes time and aborts
+     * the in-flight cycle, so let the hop-retry worker wait out transient
+     * busyness first and force the radio idle only once the busy streak
+     * shows it is not settling. */
+    int err = esb_set_rf_channel(channel);
+#if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_HOP)
+    if (err == -EBUSY &&
+        ++m_set_channel_busy_streak >= CONFIG_ZMK_ESB_ENDPOINT_HOP_STOP_TX_AFTER_BUSY) {
+        esb_stop_tx();
+        err = esb_set_rf_channel(channel);
+    }
+    if (err == 0) {
+        m_set_channel_busy_streak = 0;
+    }
+#endif
     if (err) {
+        k_sched_unlock();
         return err;
     }
     m_addr.channel = channel;
@@ -1108,6 +1133,7 @@ int esb_transport_set_channel(const uint8_t channel) {
         k_uptime_get_32() + CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_HOP_POST_QUIET_MS;
     m_tx_quiet_until_ms = (quiet_until == 0) ? 1 : quiet_until;
 #endif
+    k_sched_unlock();
     return 0;
 }
 
@@ -1227,6 +1253,13 @@ int esb_transport_send(const uint8_t pipe, const uint8_t *data, uint8_t len) {
     }
 #endif
 
+    /* Sends arrive from multiple thread contexts (input thread, system
+     * workqueue); the section below is a multi-step low-level ESB
+     * sequence (retransmit knobs, ring pushes, FIFO write) that must not
+     * interleave between threads. ISRs keep running — the vendored
+     * library irq-locks its own hardware-critical parts. */
+    k_sched_lock();
+
     /* Jitter the retransmit delay per-send. De-correlates retries from
      * periodic 2.4 GHz interferers (WiFi beacons, BLE adv) that might
      * happen to line up with the fixed base delay. Cheap — one xorshift
@@ -1245,6 +1278,7 @@ int esb_transport_send(const uint8_t pipe, const uint8_t *data, uint8_t len) {
     if (m_tx_quiet_until_ms != 0) {
         const uint32_t now = k_uptime_get_32();
         if ((int32_t)(m_tx_quiet_until_ms - now) > 0) {
+            k_sched_unlock();
             return 0;
         }
         m_tx_quiet_until_ms = 0;
@@ -1286,6 +1320,7 @@ int esb_transport_send(const uint8_t pipe, const uint8_t *data, uint8_t len) {
      * -ENOMEM by re-queueing the unsent bytes. */
     if (esb_tx_full()) {
         if (is_shell) {
+            k_sched_unlock();
             return -ENOMEM;
         }
         esb_flush_tx_and_reset();
@@ -1402,7 +1437,9 @@ int esb_transport_send(const uint8_t pipe, const uint8_t *data, uint8_t len) {
         motion_ring_push(NULL, false);
     }
 
-    return esb_write_payload(&pkt);
+    const int ret = esb_write_payload(&pkt);
+    k_sched_unlock();
+    return ret;
 }
 
 #if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_RENDEZVOUS)
@@ -1426,11 +1463,15 @@ int esb_transport_send_blocking(const uint8_t channel, const uint8_t pipe,
      * inverse restore returns the radio to the active channel for the
      * very next user-thread send (which we held off via m_sync_tx_in_progress
      * during the round trip). m_addr.channel is left untouched throughout —
-     * we are visiting, not committing. */
+     * we are visiting, not committing. The setup and restore sections run
+     * with preemption disabled so no other thread can slip a send onto the
+     * transient channel; the lock is dropped around the semaphore wait. */
+    k_sched_lock();
     esb_flush_tx_and_reset();
 
     const int chan_err = esb_set_rf_channel(channel);
     if (chan_err) {
+        k_sched_unlock();
         return chan_err;
     }
 
@@ -1449,8 +1490,10 @@ int esb_transport_send_blocking(const uint8_t channel, const uint8_t pipe,
     if (werr) {
         m_sync_tx_in_progress = false;
         (void)esb_set_rf_channel(m_addr.channel);
+        k_sched_unlock();
         return werr;
     }
+    k_sched_unlock();
 
     const int wait_err = k_sem_take(&m_sync_tx_done, timeout);
 
@@ -1458,12 +1501,15 @@ int esb_transport_send_blocking(const uint8_t channel, const uint8_t pipe,
      * radio on the rendezvous channel would silently break every
      * subsequent user TX. The flag is cleared by the ISR on completion;
      * on timeout we clear it here so the next caller is unblocked. */
+    k_sched_lock();
     (void)esb_set_rf_channel(m_addr.channel);
 
     if (wait_err) {
         m_sync_tx_in_progress = false;
+        k_sched_unlock();
         return -ETIMEDOUT;
     }
+    k_sched_unlock();
     return m_sync_tx_result_success ? 0 : -EIO;
 }
 #endif /* RENDEZVOUS */
@@ -1545,8 +1591,10 @@ void esb_transport_on_slot_start(void) {
     if (hfxo_err) {
         LOG_ERR("ESB slot start: HFXO failed (%d), radio may be unreliable", hfxo_err);
     }
+    k_sched_lock();
     const int init_err = esb_init_and_configure();
     if (init_err) {
+        k_sched_unlock();
         LOG_ERR("ESB slot start: init failed (%d)", init_err);
         return;
     }
@@ -1575,6 +1623,7 @@ void esb_transport_on_slot_start(void) {
     k_work_reschedule(&m_adaptive_retry_work,
                       K_MSEC(CONFIG_ZMK_ESB_ENDPOINT_ADAPTIVE_RETRY_INTERVAL_MS));
 #endif
+    k_sched_unlock();
     LOG_DBG("ESB slot start OK (VTOR[RADIO]=0x%08x)",
             m_ram_vtor[16 + RADIO_IRQn]);
 }
@@ -1587,6 +1636,7 @@ void esb_transport_on_slot_stop(void) {
     k_work_cancel_delayable(&m_adaptive_retry_work);
 #endif
 
+    k_sched_lock();
     esb_disable();
 
     if (m_ram_vtor_installed) {
@@ -1597,6 +1647,7 @@ void esb_transport_on_slot_stop(void) {
         irq_enable(RADIO_IRQn);
         LOG_DBG("VTOR[RADIO] restored to 0x%08x", saved_radio_vector);
     }
+    k_sched_unlock();
 
     bt_ll_resume();
     hfxo_release();

@@ -52,7 +52,7 @@ config ZMK_ESB_ENDPOINT_ADAPTIVE_RETRY
 config ZMK_ESB_ENDPOINT_ADAPTIVE_RETRY_INTERVAL_MS
     int "Adaptive retry: re-evaluation interval (ms)"
     depends on ZMK_ESB_ENDPOINT_ADAPTIVE_RETRY
-    default 35
+    default 25
     range 10 5000
     help
       Cadence at which the adaptive-retry worker recomputes the target
@@ -62,7 +62,7 @@ config ZMK_ESB_ENDPOINT_ADAPTIVE_RETRY_INTERVAL_MS
 config ZMK_ESB_ENDPOINT_ADAPTIVE_RETRY_EWMA_LOW
     int "Adaptive retry: lower EWMA breakpoint (attempts × 10)"
     depends on ZMK_ESB_ENDPOINT_ADAPTIVE_RETRY
-    default 15
+    default 12
     range 10 100
     help
       Below this EWMA value (in tx_attempts × 10) the link is treated as
@@ -72,7 +72,7 @@ config ZMK_ESB_ENDPOINT_ADAPTIVE_RETRY_EWMA_LOW
 config ZMK_ESB_ENDPOINT_ADAPTIVE_RETRY_EWMA_HIGH
     int "Adaptive retry: upper EWMA breakpoint (attempts × 10)"
     depends on ZMK_ESB_ENDPOINT_ADAPTIVE_RETRY
-    default 45
+    default 30
     range 11 200
     help
       At or above this EWMA value (in tx_attempts × 10) the link is
@@ -83,7 +83,7 @@ config ZMK_ESB_ENDPOINT_ADAPTIVE_RETRY_EWMA_HIGH
 config ZMK_ESB_ENDPOINT_ADAPTIVE_RETRY_COUNT_MIN
     int "Adaptive retry: minimum retransmit_count on a clean link"
     depends on ZMK_ESB_ENDPOINT_ADAPTIVE_RETRY
-    default 2
+    default 3
     range 0 15
     help
       Floor for the adaptive retransmit_count. Applied when the EWMA is
@@ -232,11 +232,11 @@ config ZMK_ESB_ENDPOINT_RETRANSMIT_COUNT
 
 config ZMK_ESB_ENDPOINT_RETRANSMIT_DELAY_US
     int "ESB retransmit delay (microseconds)"
-    default 570
+    default 610
 
 config ZMK_ESB_ENDPOINT_POINTER_RETRANSMIT_COUNT
     int "ESB retransmit count for pointer/scroll-only mouse reports"
-    default 2
+    default 3
     range 0 15
     help
       Mouse reports that carry pointer or scroll motion but no button
@@ -253,7 +253,7 @@ config ZMK_ESB_ENDPOINT_POINTER_RETRANSMIT_COUNT
 
 config ZMK_ESB_ENDPOINT_POINTER_MOTION_RING_SIZE
     int "Per-send motion record ring depth (pointer/scroll refund)"
-    default 24
+    default 48
     range 2 64
     help
       Capacity of the parallel ring that stores each recent mouse-report
@@ -266,7 +266,7 @@ config ZMK_ESB_ENDPOINT_POINTER_MOTION_RING_SIZE
 
 config ZMK_ESB_ENDPOINT_POINTER_REFUND_STALE_MS
     int "Drop accumulated pointer-refund deltas older than this (ms)"
-    default 100
+    default 200
     range 1 5000
     help
       Maximum age of pending pointer/scroll refund deltas before they
@@ -278,7 +278,7 @@ config ZMK_ESB_ENDPOINT_POINTER_REFUND_STALE_MS
 
 config ZMK_ESB_ENDPOINT_POINTER_INFLIGHT_CAP
     int "Maximum in-flight pointer-motion HID reports queued to ESB"
-    default 4
+    default 7
     range 1 32
     help
       Cap on the number of mouse motion HID reports that may be sitting
@@ -335,7 +335,7 @@ config ZMK_ESB_ENDPOINT_CRITICAL_RETRANSMIT_COUNT
 config ZMK_ESB_ENDPOINT_CRIT_OVERRIDE_RING_SIZE
     int "Critical-override per-send ring depth"
     depends on ZMK_ESB_ENDPOINT_CRITICAL_MAX_RETRANSMIT
-    default 8
+    default 16
     range 2 64
     help
       Capacity of the parallel ring tracking which recent sends pushed the
@@ -393,7 +393,7 @@ config ZMK_ESB_ENDPOINT_BLE_QUIESCE_MS
 
 config ZMK_ESB_ENDPOINT_CTRL_STACK_SIZE
     int "ESB control thread stack size (bytes)"
-    default 2048
+    default 1280
 
 config ZMK_ESB_ENDPOINT_CTRL_THREAD_PRIORITY
     int "ESB control thread cooperative priority"
@@ -407,12 +407,12 @@ config ZMK_ESB_ENDPOINT_CTRL_MSGQ_DEPTH
 
 config ZMK_ESB_ENDPOINT_TX_FAIL_WARN_THRESHOLD
     int "Consecutive TX failures before warning log"
-    default 3
+    default 5
     range 1 100
 
 config ZMK_ESB_ENDPOINT_TX_FAIL_ERR_THRESHOLD
     int "Consecutive TX failures before error log and TX flush"
-    default 5
+    default 10
     range 1 100
 
 config ZMK_ESB_ENDPOINT_HID_QUIET_KB_QUEUE_DEPTH
@@ -431,7 +431,7 @@ config ZMK_ESB_ENDPOINT_HID_QUIET_KB_QUEUE_DEPTH
 
 config ZMK_ESB_ENDPOINT_HID_QUIET_CONS_QUEUE_DEPTH
     int "Consumer HID report snapshot ring depth for transport-quiet windows"
-    default 4
+    default 5
     range 1 64
     help
       Same role as HID_QUIET_KB_QUEUE_DEPTH but for consumer (media key)
@@ -452,7 +452,7 @@ config ZMK_ESB_ENDPOINT_HID_QUIET_RETRY_MS
 
 config ZMK_ESB_ENDPOINT_IP_PENDING_BTN_QUEUE
     int "Input-processor pending button-edge queue depth"
-    default 4
+    default 8
     range 1 32
     help
       Per-instance ring depth for mouse-button edges that fall during a
@@ -487,8 +487,8 @@ if ZMK_ESB_ENDPOINT_CHANNEL_HOP
 
 config ZMK_ESB_ENDPOINT_HOP_RETRY_DELAY_MS
     int "Hop-worker re-arm delay after esb_transport_set_channel -EBUSY (ms)"
-    default 5 if ZMK_ESB_ENDPOINT_CRITICAL_MAX_RETRANSMIT
-    default 2
+    default 2 if ZMK_ESB_ENDPOINT_CRITICAL_MAX_RETRANSMIT
+    default 1
     range 1 100
     help
       Delay before re-submitting hop_work after esb_transport_set_channel
@@ -502,9 +502,14 @@ config ZMK_ESB_ENDPOINT_HOP_RETRY_DELAY_MS
       then ride at CRITICAL_RETRANSMIT_COUNT instead of the global
       RETRANSMIT_COUNT, making the worst-case drain longer.
 
+config ZMK_ESB_ENDPOINT_HOP_STOP_TX_AFTER_BUSY
+    int "Consecutive -EBUSY hop attempts before forcing the radio idle"
+    default 2
+    range 1 20
+
 config ZMK_ESB_ENDPOINT_CHANNEL_HOP_TX_FAIL_WINDOW_MS
     int "Continuous TX-failure duration before triggering a channel hop (ms)"
-    default 45
+    default 85
     range 2 1000
     help
       A channel hop fires once TX has been failing continuously for this
@@ -516,7 +521,7 @@ config ZMK_ESB_ENDPOINT_CHANNEL_HOP_TX_FAIL_WINDOW_MS
 
 config ZMK_ESB_ENDPOINT_CHANNEL_HOP_WEAK_LINK_MS
     int "No-TX_SUCCESS duration before triggering a weak-link hop (ms)"
-    default 70
+    default 135
     range 0 5000
     help
       Hop if no TX_SUCCESS has arrived for this long while actively
@@ -534,7 +539,7 @@ config ZMK_ESB_ENDPOINT_CHANNEL_HOP_WEAK_LINK_MS
 
 config ZMK_ESB_ENDPOINT_CHANNEL_HOP_POST_QUIET_MS
     int "Post-hop quiet period before resuming TX (ms)"
-    default 2
+    default 1
     range 0 1000
     help
       After a channel hop, suppress all outgoing traffic for this many
@@ -547,7 +552,7 @@ config ZMK_ESB_ENDPOINT_CHANNEL_HOP_POST_QUIET_MS
 
 config ZMK_ESB_ENDPOINT_MOTION_MAX_STALE_MS
     int "Drop accumulated pointer motion older than this (ms)"
-    default 100
+    default 200
     range 1 5000
     help
       Maximum age of accumulated pointer deltas in the ESB input
@@ -578,6 +583,68 @@ config ZMK_ESB_ENDPOINT_CHANNEL_QUARANTINE_MIN_DISTANCE
       every quarantined channel. If no channel satisfies the full
       distance, the selection progressively relaxes the distance (down
       to adjacent, but never reusing a quarantined channel itself).
+
+config ZMK_ESB_ENDPOINT_CHANNEL_QUARANTINE_PERSIST
+    bool "Persist worst-offender channels across reboots (hit count)"
+    default n
+    help
+      Count how often each channel is condemned by a fail-driven hop in
+      an in-memory hit table (3N entries) and periodically distil the N
+      worst offenders into a set that is avoided when picking future
+      channels, persisting it to NVS so it survives reboots. Avoided
+      channels are hard-excluded and buffered at half CHANNEL_QUARANTINE
+      _MIN_DISTANCE. N is runtime-configurable via the ZRC key
+      esb/quar_n.
+
+config ZMK_ESB_ENDPOINT_CHANNEL_QUARANTINE_PERSIST_SIZE
+    int "Number of worst-offender channels to remember (N)"
+    depends on ZMK_ESB_ENDPOINT_CHANNEL_QUARANTINE_PERSIST
+    default 5
+    range 1 32
+    help
+      Number of worst-offender channels persisted and avoided, and the
+      default effective N (lowerable at runtime via ZRC key esb/quar_n).
+      The in-memory hit table tracks 3N channels.
+
+config ZMK_ESB_ENDPOINT_CHANNEL_QUARANTINE_PERSIST_THRESHOLD
+    int "Hits required before a channel is persistently avoided"
+    depends on ZMK_ESB_ENDPOINT_CHANNEL_QUARANTINE_PERSIST
+    default 3
+    range 1 255
+    help
+      A channel must be condemned by a fail-driven hop this many times
+      before it is promoted into the persisted avoided set. Until then
+      it stays pickable (subject only to the expiring timed quarantine),
+      so it keeps being re-tested and can accumulate further hits — a
+      threshold of 1 would freeze every channel after a single bad
+      encounter and make the hit counts meaningless. Channels that were
+      bad only once therefore fade on their own as their timed
+      quarantine lapses; only repeat offenders are avoided long-term.
+
+config ZMK_ESB_ENDPOINT_CHANNEL_QUARANTINE_PERSIST_INTERVAL_MS
+    int "Interval between hit-table distil + NVS writes (ms)"
+    depends on ZMK_ESB_ENDPOINT_CHANNEL_QUARANTINE_PERSIST
+    default 1200000
+    range 1000 3600000
+    help
+      How often the hit table is distilled into the persisted worst-
+      offender set and written to NVS. Writes are skipped when the
+      resulting set is unchanged, so a quiet link costs no flash wear.
+
+config ZMK_ESB_ENDPOINT_CHANNEL_QUARANTINE_PERSIST_DECAY_S
+    int "Decay period — age every channel by one hit per this many seconds"
+    depends on ZMK_ESB_ENDPOINT_CHANNEL_QUARANTINE_PERSIST
+    default 86400
+    range 0 2592000
+    help
+      Every channel's hit count is reduced by one each time this much
+      powered-on time elapses, letting a once-bad channel that has since
+      gone quiet fall back below the promotion threshold and become
+      re-testable instead of being avoided forever. There is no RTC, so
+      elapsed time is accumulated from uptime (which advances through
+      idle) and persisted in whole minutes, checked at boot, on wake, and
+      on every speculative hop. 0 disables decay (offenders are remembered
+      until evicted or reclaimed).
 
 config ZMK_ESB_ENDPOINT_CHANNEL_HOP_NEGOTIATE_INTERVAL_MS
     int "Interval between channel-hop negotiation rounds (ms) — steady state"
@@ -642,7 +709,7 @@ config ZMK_ESB_ENDPOINT_CHANNEL_HOP_POST_BURST_COUNT
 
 config ZMK_ESB_ENDPOINT_CHANNEL_HOP_POST_BURST_INTERVAL_MS
     int "Post-hop PROPOSAL burst interval (ms between packets)"
-    default 15
+    default 25
     range 5 1000
 
 config ZMK_ESB_ENDPOINT_CHANNEL_HOP_POST_BURST_RENDEZVOUS_EVERY
@@ -660,18 +727,18 @@ config ZMK_ESB_ENDPOINT_CHANNEL_HOP_POST_BURST_RENDEZVOUS_EVERY
 
 config ZMK_ESB_ENDPOINT_CHANNEL_HOP_RENDEZVOUS_TIMEOUT_MS
     int "Synchronous rendezvous PROPOSAL TX timeout (ms)"
-    default 10
+    default 20
     range 1 50
     help
       Hard cap on how long the post-hop burst handler will block waiting
-      for the rendezvous-channel PROPOSAL's TX_SUCCESS or TX_FAILED. With
-      retransmit_count=2 and retransmit_delay=470us a worst-case 2-Mbps
-      packet round trip is well under 2 ms; 5 ms allows comfortable
-      headroom without ever stalling the system workqueue.
+      for the rendezvous-channel PROPOSAL's TX_SUCCESS or TX_FAILED. A
+      worst-case packet round trip at the configured retransmit count and
+      delay stays well under this cap, so it bounds the side-trip's
+      blocking time without ever stalling the system workqueue.
 
 config ZMK_ESB_ENDPOINT_CHANNEL_HOP_RENDEZVOUS_FALLBACK_MS
     int "Force a rendezvous-channel hop after this many ms of post-hop TX failure"
-    default 200
+    default 300
     range 0 10000
     help
       If TX continues to fail for this long after a hop committed (i.e.
@@ -708,7 +775,7 @@ config ZMK_ESB_ENDPOINT_CHANNEL_HOP_RENDEZVOUS_HOLD_MS
 
 config ZMK_ESB_ENDPOINT_CHANNEL_HOP_COOLDOWN_MS
     int "Minimum dwell on the new channel before another hop can fire (ms)"
-    default 250
+    default 305
     range 0 10000
     help
       After a successful channel hop, TX-failure-triggered hops are
@@ -720,7 +787,7 @@ config ZMK_ESB_ENDPOINT_CHANNEL_HOP_COOLDOWN_MS
 
 config ZMK_ESB_ENDPOINT_LINK_QUALITY_WINDOW
     int "Link-quality sliding window size (ACKed packets)"
-    default 32
+    default 24
     range 8 32
     help
       Number of recent ACKed TX events held in the link-quality shift
@@ -752,7 +819,7 @@ config ZMK_ESB_ENDPOINT_LINK_DEGRADED_THRESHOLD
 
 config ZMK_ESB_ENDPOINT_LINK_DEGRADED_REARM
     int "Cooperative-hop trigger: re-arm threshold"
-    default 2
+    default 3
     range 0 32
     help
       After a cooperative-hop trigger fires, suppress further triggers
@@ -762,7 +829,7 @@ config ZMK_ESB_ENDPOINT_LINK_DEGRADED_REARM
 
 config ZMK_ESB_ENDPOINT_LINK_DEGRADED_FAST_THRESHOLD
     int "Cooperative-hop trigger: retried packets in last 8"
-    default 4
+    default 2
     range 0 8
     help
       Fast-path trigger: also fire if at least this many of the most
@@ -772,15 +839,15 @@ config ZMK_ESB_ENDPOINT_LINK_DEGRADED_FAST_THRESHOLD
 
 config ZMK_ESB_ENDPOINT_COOP_HOP_HOP_IN_MS
     int "Cooperative hop: delay between OFFER delivery and channel switch (ms)"
-    default 4
+    default 5
     range 2 50
     help
       How long after the HOP_OFFER is delivered both sides wait before
       flipping the radio. Must exceed the worst-case workqueue
-      scheduling jitter on either side (~1 ms) plus enough margin for
-      the dongle's stop_rx → set_channel → start_rx sequence
-      (CONFIG_DONGLE_COOP_HOP_PRX_SETUP_BUDGET_MS). 8 ms is a
-      comfortable default; lower values reduce blackout but risk skew.
+      scheduling jitter on either side plus enough margin for the
+      dongle's stop_rx → set_channel → start_rx sequence
+      (CONFIG_DONGLE_COOP_HOP_PRX_SETUP_BUDGET_MS). Lower values reduce
+      blackout but risk skew.
 
 config ZMK_ESB_ENDPOINT_COOP_HOP_COOLDOWN_MS
     int "Cooperative hop: minimum interval between two coop hops (ms)"
@@ -795,7 +862,7 @@ config ZMK_ESB_ENDPOINT_COOP_HOP_COOLDOWN_MS
 
 config ZMK_ESB_ENDPOINT_COOP_HOP_QUARANTINE_MS
     int "Cooperative hop: quarantine hold for the channel just left (ms)"
-    default 30000
+    default 120000
     range 100 600000
     help
       Coop hops fire on a moderately degraded link, where interference
@@ -824,7 +891,7 @@ config ZMK_ESB_ENDPOINT_FLUSH_QUIET_MS
 
 config ZMK_ESB_ENDPOINT_FLUSH_FORCE_MS
     int "Pre-flush wait ceiling before forced flush (ms)"
-    default 5
+    default 3
     range 1 500
     help
       Upper bound on how long esb_transport_flush_tx() will wait for

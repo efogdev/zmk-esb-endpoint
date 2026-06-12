@@ -28,8 +28,22 @@ static uint32_t prng_next(void) {
     return x;
 }
 
+#if defined(CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_QUARANTINE_PERSIST)
+bool persistent_quarantine_contains(const struct persistent_quarantine *p, uint8_t channel) {
+    for (uint8_t i = 0; i < p->count; i++) {
+        if (p->channels[i] == channel) {
+            return true;
+        }
+    }
+    return false;
+}
+#endif /* CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_QUARANTINE_PERSIST */
+
 void quarantine_reset(struct quarantine_state *q) {
     memset(q->expires_at, 0, sizeof(q->expires_at));
+#if defined(CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_QUARANTINE_PERSIST)
+    q->persistent.count = 0;
+#endif
 }
 
 void quarantine_add(struct quarantine_state *q, uint8_t channel, uint32_t hold_ms) {
@@ -45,10 +59,7 @@ void quarantine_add(struct quarantine_state *q, uint8_t channel, uint32_t hold_m
     }
 }
 
-bool quarantine_is(const struct quarantine_state *q, uint8_t channel) {
-    if (channel >= CHANNEL_HOP_CHANNEL_COUNT) {
-        return true;  /* out-of-range channels are "quarantined" i.e. rejected */
-    }
+static bool timed_quarantine_is(const struct quarantine_state *q, uint8_t channel) {
     const uint32_t e = q->expires_at[channel];
     if (e == 0) {
         return false;
@@ -56,6 +67,18 @@ bool quarantine_is(const struct quarantine_state *q, uint8_t channel) {
     /* 32-bit wrap-safe compare: quarantined iff (e - now) > 0 and not wrapped. */
     const uint32_t now = k_uptime_get_32();
     return (int32_t)(e - now) > 0;
+}
+
+bool quarantine_is(const struct quarantine_state *q, uint8_t channel) {
+    if (channel >= CHANNEL_HOP_CHANNEL_COUNT) {
+        return true;  /* out-of-range channels are "quarantined" i.e. rejected */
+    }
+#if defined(CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_QUARANTINE_PERSIST)
+    if (persistent_quarantine_contains(&q->persistent, channel)) {
+        return true;
+    }
+#endif
+    return timed_quarantine_is(q, channel);
 }
 
 uint8_t quarantine_count(const struct quarantine_state *q) {
@@ -68,9 +91,13 @@ uint8_t quarantine_count(const struct quarantine_state *q) {
     return n;
 }
 
+/* True if any TIMED-quarantined channel is within `distance` of `channel`.
+ * The persistent set is excluded here — it has its own, narrower buffer in
+ * channel_hop_pick(); a recently-bad channel warrants a full-width guard
+ * (interference bleeds into neighbours now), a historically-bad one only a
+ * half-width nudge. */
 static bool within_distance_of_quarantine(const struct quarantine_state *q,
                                           uint8_t channel, uint8_t distance) {
-    /* True if any quarantined channel is within `distance` of `channel`. */
     const int16_t lo = (int16_t)channel - (int16_t)distance;
     const int16_t hi = (int16_t)channel + (int16_t)distance;
     for (int16_t i = lo; i <= hi; i++) {
@@ -80,12 +107,31 @@ static bool within_distance_of_quarantine(const struct quarantine_state *q,
         if (i == channel) {
             continue;  /* the channel itself is handled by quarantine_is() directly */
         }
-        if (quarantine_is(q, (uint8_t)i)) {
+        if (timed_quarantine_is(q, (uint8_t)i)) {
             return true;
         }
     }
     return false;
 }
+
+#if defined(CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_QUARANTINE_PERSIST)
+/* True if any persistent worst-offender channel is within `distance` of
+ * `channel`. Used with half the timed-quarantine min_distance. */
+static bool within_distance_of_persistent(const struct quarantine_state *q,
+                                          uint8_t channel, uint8_t distance) {
+    const int16_t lo = (int16_t)channel - (int16_t)distance;
+    const int16_t hi = (int16_t)channel + (int16_t)distance;
+    for (int16_t i = lo; i <= hi; i++) {
+        if (i < 0 || i >= CHANNEL_HOP_CHANNEL_COUNT || i == channel) {
+            continue;
+        }
+        if (persistent_quarantine_contains(&q->persistent, (uint8_t)i)) {
+            return true;
+        }
+    }
+    return false;
+}
+#endif
 
 uint8_t channel_hop_pick(const struct quarantine_state *q,
                          uint8_t min_distance,
@@ -116,6 +162,14 @@ uint8_t channel_hop_pick(const struct quarantine_state *q,
             if (d > 0 && within_distance_of_quarantine(q, ch, (uint8_t)d)) {
                 continue;
             }
+#if defined(CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_QUARANTINE_PERSIST)
+            /* Persistent offenders get half the buffer of timed quarantine,
+             * relaxing in lockstep with d so the candidate-exists guarantee
+             * still holds at d=0. */
+            if (d > 1 && within_distance_of_persistent(q, ch, (uint8_t)(d / 2))) {
+                continue;
+            }
+#endif
             if (d > 0 && avoid_channel < CHANNEL_HOP_CHANNEL_COUNT) {
                 const int16_t delta = (int16_t)ch - (int16_t)avoid_channel;
                 const int16_t abs_delta = delta < 0 ? -delta : delta;

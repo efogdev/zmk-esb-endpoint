@@ -9,6 +9,15 @@
 #include "channel_hop_ep.h"
 #include "esb_transport.h"
 
+#if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_QUARANTINE_PERSIST)
+#include <zephyr/settings/settings.h>
+#if IS_ENABLED(CONFIG_ZMK_RUNTIME_CONFIG)
+#include <zmk_runtime_config/runtime_config.h>
+#else
+#define ZRC_GET(key, default_val) (default_val)
+#endif
+#endif
+
 #include <zephyr/logging/log.h>
 
 LOG_MODULE_REGISTER(zmk_esb_chhop_ep, CONFIG_ZMK_ESB_ENDPOINT_LOG_LEVEL);
@@ -212,6 +221,317 @@ static void enter_active_state(bool send_initial_proposal);
 #if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_COOP_HOP)
 static void coop_hop_abort(void);
 #endif
+
+#if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_QUARANTINE_PERSIST)
+#define PERSIST_SETTINGS_KEY "esb_hop/quar"
+#define PERSIST_ZRC_KEY      "esb/quar_n"
+
+#define PERSIST_N_MAX     CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_QUARANTINE_PERSIST_SIZE
+/* Track three times as many candidates as we ultimately keep, so a channel
+ * has to out-offend a working set before it makes the persisted top N. */
+#define HIT_TABLE_SIZE    (PERSIST_N_MAX * 3)
+/* Offender list as serialised: one length byte + (channel, u16 hits) each. */
+#define PERSIST_OFF_MAX   (1 + PERSIST_N_MAX * 3)
+/* Full NVS record: u16 decay accumulator (minutes) + the offender list. */
+#define PERSIST_REC_MAX   (2 + PERSIST_OFF_MAX)
+
+/* In-memory evidence: how many times each channel has been condemned by a
+ * fail-driven hop. Distilled to the persisted avoided set every
+ * PERSIST_INTERVAL_MS; aged by persist_decay_check(). */
+struct hit_entry {
+    uint8_t  channel;
+    uint16_t hits;
+};
+static struct hit_entry m_hits[HIT_TABLE_SIZE];
+static uint8_t m_hit_count;
+
+static struct k_work_delayable persist_work;
+
+/* Powered-on-time decay clock. There is no RTC, so elapsed wall time cannot
+ * survive a power cycle; instead we accumulate uptime deltas (which keep
+ * advancing through idle), sampled at boot, wake, and every speculative hop.
+ * The accumulator is kept in whole minutes (m_decay_accum_min) and persisted,
+ * so progress toward the next DECAY_S period survives reboots; m_decay_frac_ms
+ * carries the sub-minute remainder (RAM only — losing <1 min on reboot is
+ * harmless). m_decay_last_uptime is the previous sample, re-anchored to the
+ * current uptime on boot/wrap so the reset-to-zero after a reboot — where
+ * `now` jumps below the previous sample — contributes nothing. */
+static uint32_t m_decay_accum_min;
+static uint32_t m_decay_frac_ms;
+static uint32_t m_decay_last_uptime;
+static uint16_t m_saved_accum_min;
+
+/* Serialised offender list as last rebuilt, and the copy last written to NVS.
+ * The offender list is rewritten only when it changes; the decay accumulator
+ * rides along in the same record but is flushed at coarse granularity so the
+ * per-hop checks don't burn flash. */
+static uint8_t m_off_buf[PERSIST_OFF_MAX];
+static uint8_t m_off_len;
+static uint8_t m_saved_off[PERSIST_OFF_MAX];
+static uint8_t m_saved_off_len;
+
+static uint8_t persist_n(void) {
+    uint8_t n = (uint8_t)ZRC_GET(PERSIST_ZRC_KEY, PERSIST_N_MAX);
+    return n > PERSIST_N_MAX ? PERSIST_N_MAX : n;
+}
+
+/* DECAY_S expressed in whole minutes (the accumulator's unit); 0 disables
+ * decay, and a sub-minute interval is clamped up to 1 minute. */
+static uint32_t persist_decay_period_min(void) {
+    const uint32_t s = CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_QUARANTINE_PERSIST_DECAY_S;
+    if (s == 0) {
+        return 0;
+    }
+    const uint32_t m = s / 60u;
+    return m == 0 ? 1u : m;
+}
+
+/* Record one condemnation of `channel`. Space-Saving style: count if
+ * present, append while there is room, otherwise overwrite the
+ * least-offending slot and inherit its count + 1 so a genuinely bad
+ * newcomer can still climb past stale entries. */
+static void persist_record_hit(uint8_t channel) {
+    if (channel >= CHANNEL_HOP_CHANNEL_COUNT) {
+        return;
+    }
+    for (uint8_t i = 0; i < m_hit_count; i++) {
+        if (m_hits[i].channel == channel) {
+            if (m_hits[i].hits < UINT16_MAX) {
+                m_hits[i].hits++;
+            }
+            return;
+        }
+    }
+    if (m_hit_count < ARRAY_SIZE(m_hits)) {
+        m_hits[m_hit_count].channel = channel;
+        m_hits[m_hit_count].hits = 1;
+        m_hit_count++;
+        return;
+    }
+    uint8_t min_i = 0;
+    for (uint8_t i = 1; i < m_hit_count; i++) {
+        if (m_hits[i].hits < m_hits[min_i].hits) {
+            min_i = i;
+        }
+    }
+    m_hits[min_i].channel = channel;
+    if (m_hits[min_i].hits < UINT16_MAX) {
+        m_hits[min_i].hits++;
+    }
+}
+
+/* A channel we are deliberately reoccupying (revert / rendezvous): drop its
+ * evidence and remove it from the live avoided set so the picker and its
+ * buffer stop fighting the move. The next distill persists the change. */
+static void persist_reclaim(uint8_t channel) {
+    for (uint8_t i = 0; i < m_hit_count; i++) {
+        if (m_hits[i].channel == channel) {
+            m_hits[i] = m_hits[--m_hit_count];
+            break;
+        }
+    }
+    struct persistent_quarantine *p = &m_quarantine.persistent;
+    for (uint8_t i = 0; i < p->count; i++) {
+        if (p->channels[i] == channel) {
+            p->channels[i] = p->channels[--p->count];
+            break;
+        }
+    }
+}
+
+/* Recompute the avoided set (and its serialised form m_off_buf) from the hit
+ * table: the top persist_n() channels that have reached the promotion
+ * threshold. Sub-threshold channels stay pickable so they keep being
+ * re-tested between timed-quarantine cooldowns — without this gate a channel
+ * would be avoided after its very first hit and could never accumulate a
+ * second. Partial selection sort — N and the table are small. */
+static void persist_rebuild_avoided(void) {
+    const uint8_t n_max = persist_n();
+    bool used[ARRAY_SIZE(m_hits)] = { false };
+    uint8_t out = 0;
+    size_t p = 1;
+
+    while (out < n_max) {
+        uint8_t best = 0xFF;
+        for (uint8_t i = 0; i < m_hit_count; i++) {
+            if (used[i] ||
+                m_hits[i].hits < CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_QUARANTINE_PERSIST_THRESHOLD) {
+                continue;
+            }
+            if (best == 0xFF || m_hits[i].hits > m_hits[best].hits) {
+                best = i;
+            }
+        }
+        if (best == 0xFF) {
+            break;
+        }
+        used[best] = true;
+        m_quarantine.persistent.channels[out] = m_hits[best].channel;
+        m_off_buf[p++] = m_hits[best].channel;
+        m_off_buf[p++] = (uint8_t)(m_hits[best].hits & 0xFF);
+        m_off_buf[p++] = (uint8_t)(m_hits[best].hits >> 8);
+        out++;
+    }
+    m_quarantine.persistent.count = out;
+    m_off_buf[0] = out;
+    m_off_len = (uint8_t)p;
+}
+
+/* Write the full record — accumulator (minutes) + current offender list — to
+ * NVS and refresh the in-RAM snapshots used for write suppression. */
+static void persist_write(void) {
+    uint8_t buf[PERSIST_REC_MAX];
+    const uint16_t acc = m_decay_accum_min > UINT16_MAX
+                       ? UINT16_MAX : (uint16_t)m_decay_accum_min;
+    buf[0] = (uint8_t)(acc & 0xFF);
+    buf[1] = (uint8_t)(acc >> 8);
+    memcpy(&buf[2], m_off_buf, m_off_len);
+    settings_save_one(PERSIST_SETTINGS_KEY, buf, 2 + m_off_len);
+    memcpy(m_saved_off, m_off_buf, m_off_len);
+    m_saved_off_len = m_off_len;
+    m_saved_accum_min = acc;
+}
+
+static bool offenders_changed(void) {
+    return m_off_len != m_saved_off_len ||
+           memcmp(m_off_buf, m_saved_off, m_off_len) != 0;
+}
+
+/* Periodic distill: rebuild the avoided set and persist only if the offender
+ * list actually changed (the accumulator is flushed separately). */
+static void persist_work_fn(struct k_work *w) {
+    ARG_UNUSED(w);
+    persist_rebuild_avoided();
+    if (offenders_changed()) {
+        persist_write();
+    }
+    k_work_reschedule(&persist_work,
+                      K_MSEC(CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_QUARANTINE_PERSIST_INTERVAL_MS));
+}
+
+/* Age every tracked channel by `periods` hits and drop those that reach zero.
+ * A promoted offender is frozen (avoided → never re-picked → never re-hit),
+ * so decay is the only thing that erodes it: once it falls back below the
+ * threshold the next rebuild removes it from the avoided set and it becomes
+ * pickable — and re-testable — again. */
+static void persist_decay_apply(uint32_t periods) {
+    uint8_t w = 0;
+    for (uint8_t i = 0; i < m_hit_count; i++) {
+        if (m_hits[i].hits > periods) {
+            m_hits[i].hits = (uint16_t)(m_hits[i].hits - periods);
+            m_hits[w++] = m_hits[i];
+        }
+    }
+    m_hit_count = w;
+}
+
+/* Advance the powered-on-time decay clock and apply any whole DECAY_S periods
+ * that have elapsed. Called at boot, on wake, and on every speculative hop.
+ * Cheap and write-free unless a decay actually fires or the accumulator has
+ * advanced past a coarse flush step since the last NVS write. */
+static void persist_decay_check(void) {
+    const uint32_t period_min = persist_decay_period_min();
+    if (period_min == 0) {
+        return;  /* decay disabled */
+    }
+    const uint32_t now = k_uptime_get_32();
+    if (now >= m_decay_last_uptime) {
+        m_decay_frac_ms += now - m_decay_last_uptime;
+    }
+    /* else: uptime reset (reboot) or 32-bit wrap — contribute nothing. */
+    m_decay_last_uptime = now;
+    if (m_decay_frac_ms >= 60000u) {
+        m_decay_accum_min += m_decay_frac_ms / 60000u;
+        m_decay_frac_ms %= 60000u;
+    }
+
+    bool fired = false;
+    if (m_decay_accum_min >= period_min) {
+        const uint32_t periods = m_decay_accum_min / period_min;
+        m_decay_accum_min -= periods * period_min;
+        persist_decay_apply(periods);
+        persist_rebuild_avoided();
+        fired = true;
+    }
+
+    /* Flush the accumulator to NVS at ~1/16 of a period so progress survives
+     * a reboot without a write on every hop. A fired decay always writes. */
+    const uint32_t flush = MAX(1u, period_min / 16u);
+    if (fired || m_decay_accum_min >= (uint32_t)m_saved_accum_min + flush) {
+        persist_write();
+    }
+}
+
+static int persist_settings_load_cb(const char *name, size_t len,
+                                    settings_read_cb read_cb, void *cb_arg) {
+    if (!settings_name_steq(name, "quar", NULL)) {
+        return 0;
+    }
+    if (len < 3 || len > PERSIST_REC_MAX) {
+        LOG_WRN("unexpected quarantine record length %zu, dropping", len);
+        return 0;
+    }
+    uint8_t buf[PERSIST_REC_MAX];
+    if (read_cb(cb_arg, buf, len) < 0) {
+        return 0;
+    }
+    m_decay_accum_min = (uint16_t)buf[0] | ((uint16_t)buf[1] << 8);
+
+    const uint8_t *off = &buf[2];
+    const size_t off_len = len - 2;
+    uint8_t stored = off[0];
+    if ((size_t)(1 + stored * 3) > off_len) {
+        stored = (uint8_t)((off_len - 1) / 3);
+    }
+    for (uint8_t i = 0; i < stored; i++) {
+        const uint8_t ch = off[1 + i * 3];
+        const uint16_t hits = (uint16_t)off[2 + i * 3] | ((uint16_t)off[3 + i * 3] << 8);
+        if (ch >= CHANNEL_HOP_CHANNEL_COUNT) {
+            continue;
+        }
+        /* Seed the evidence table so the ranking survives the reboot. */
+        if (m_hit_count < ARRAY_SIZE(m_hits)) {
+            m_hits[m_hit_count].channel = ch;
+            m_hits[m_hit_count].hits = hits ? hits : 1;
+            m_hit_count++;
+        }
+    }
+    return 0;
+}
+
+SETTINGS_STATIC_HANDLER_DEFINE(esb_hop, "esb_hop", NULL, persist_settings_load_cb, NULL, NULL);
+
+static void persist_load(void) {
+    m_hit_count = 0;
+    m_off_len = 0;
+    m_saved_off_len = 0;
+    m_decay_accum_min = 0;
+    m_decay_frac_ms = 0;
+    m_decay_last_uptime = k_uptime_get_32();
+    m_saved_accum_min = 0;
+#if IS_ENABLED(CONFIG_ZMK_RUNTIME_CONFIG)
+    zrc_register(PERSIST_ZRC_KEY, PERSIST_N_MAX, 0, PERSIST_N_MAX);
+#endif
+    settings_subsys_init();
+    settings_load_subtree("esb_hop");
+    /* Build the avoided set from whatever was seeded and snapshot the
+     * on-flash state so the first distill / flush doesn't rewrite it. */
+    persist_rebuild_avoided();
+    memcpy(m_saved_off, m_off_buf, m_off_len);
+    m_saved_off_len = m_off_len;
+    m_saved_accum_min = m_decay_accum_min > UINT16_MAX
+                      ? UINT16_MAX : (uint16_t)m_decay_accum_min;
+    k_work_init_delayable(&persist_work, persist_work_fn);
+    k_work_reschedule(&persist_work,
+                      K_MSEC(CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_QUARANTINE_PERSIST_INTERVAL_MS));
+    /* Boot check: a full period may already have elapsed across prior runs. */
+    persist_decay_check();
+}
+#else
+static inline void persist_record_hit(uint8_t channel) { ARG_UNUSED(channel); }
+static inline void persist_reclaim(uint8_t channel) { ARG_UNUSED(channel); }
+static inline void persist_decay_check(void) {}
+#endif /* CHANNEL_QUARANTINE_PERSIST */
 
 static uint8_t pick_candidate(void) {
     const uint8_t current = esb_transport_get_channel();
@@ -517,6 +837,7 @@ static void enter_active_state(bool send_initial_proposal) {
     }
     m_active = true;
     LOG_DBG("endpoint entering ACTIVE");
+    persist_decay_check();
     k_work_reschedule(&idle_check_work,
                       K_MSEC(CONFIG_ZMK_ESB_ENDPOINT_IDLE_THRESHOLD_MS));
     if (send_initial_proposal) {
@@ -590,6 +911,7 @@ static void commit_hop_bookkeeping(uint8_t prev, uint32_t quarantine_ms) {
 
 static void hop_work_fn(struct k_work *w) {
     ARG_UNUSED(w);
+    persist_decay_check();
     const uint8_t current = esb_transport_get_channel();
 
     /* Snapshot once — TX_SUCCESS ISR can clear m_prev_channel while we
@@ -678,6 +1000,7 @@ static void hop_work_fn(struct k_work *w) {
          * to find us and resume normal negotiation. Also bypass the
          * shared bookkeeping's quarantine_add of `current`. */
         m_quarantine.expires_at[target] = 0;
+        persist_reclaim(target);
         m_prev_channel = CHANNEL_HOP_INVALID;
         LOG_WRN("rendezvous fallback: %u -> %u (cooldown desync recovery)",
                 current, target);
@@ -708,8 +1031,10 @@ static void hop_work_fn(struct k_work *w) {
 
     if (is_revert) {
         /* The prev channel was quarantined by the previous hop; clear that
-         * so we are allowed to occupy it again. */
+         * so we are allowed to occupy it again — both the timed quarantine
+         * and any persistent-offender record. */
         m_quarantine.expires_at[target] = 0;
+        persist_reclaim(target);
         LOG_WRN("no TX success since last hop; reverted %u -> %u", current, target);
     }
 
@@ -723,6 +1048,11 @@ static void hop_work_fn(struct k_work *w) {
             (unsigned)CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_QUARANTINE_MS);
 
     commit_hop_bookkeeping(current, CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_QUARANTINE_MS);
+
+    /* A fail-driven hop leaves behind a channel that just proved bad —
+     * register a hit against it. Coop hops fire on transient degradation
+     * rather than a confirmed-bad channel and deliberately do not. */
+    persist_record_hit(current);
 }
 
 /* ----- Cooperative-hop handshake ----- */
@@ -866,6 +1196,9 @@ void channel_hop_ep_on_link_degraded_isr(void) {
 
 void channel_hop_ep_init(void) {
     quarantine_reset(&m_quarantine);
+#if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_QUARANTINE_PERSIST)
+    persist_load();
+#endif
     m_committed_next = CHANNEL_HOP_INVALID;
     m_committed_synced = false;
     m_prev_channel = CHANNEL_HOP_INVALID;
@@ -1033,19 +1366,18 @@ void channel_hop_ep_on_request(void) {
      * to actually transmit the PROPOSAL instead of skipping it. */
     m_committed_synced = false;
     k_work_reschedule(&negotiate_work, K_NO_WAIT);
-    LOG_INF("REQUEST received — burst of %u PROPOSAL attempts + hop trigger",
+    LOG_INF("REQUEST received — burst of %u PROPOSAL attempts",
             m_request_burst_remaining);
 
-    /* Also trigger a hop. REQUEST is positive evidence the dongle just
-     * came out of a failed validation (its committed_next was cleared),
-     * which strongly implies the current channel can no longer carry the
-     * link reliably — otherwise the dongle's silence watchdog wouldn't
-     * have fired in the first place. Re-affirming PROPOSALs alone leaves
-     * us on the same dead channel; the only way out is to actually hop.
-     * The funnel goes through the same TX-fail entry point, so cooldown,
-     * m_active, and the rendezvous-fallback gating all keep working —
-     * a REQUEST during cooldown is harmless (returns early). */
-    channel_hop_ep_on_tx_fail_isr();
+    /* Respond by re-proposing only — never by hopping. A REQUEST means the
+     * dongle lost its pre-negotiated next channel (typically its own
+     * speculative-hop validation reverted and cleared committed_next), not
+     * that the current channel is bad. Triggering a hop here turns routine
+     * dongle-side desync into a self-sustaining storm: the hop clears
+     * committed_next on both ends, the dongle re-REQUESTs on its next ACK,
+     * and the link never settles even while it is perfectly healthy.
+     * Genuine bad-channel recovery stays owned by the TX-fail and weak-link
+     * triggers, which fire on actual transmit failures. */
 }
 
 void channel_hop_ep_on_tx_fail_isr(void) {
