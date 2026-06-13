@@ -236,7 +236,7 @@ config ZMK_ESB_ENDPOINT_RETRANSMIT_DELAY_US
 
 config ZMK_ESB_ENDPOINT_POINTER_RETRANSMIT_COUNT
     int "ESB retransmit count for pointer/scroll-only mouse reports"
-    default 3
+    default 4
     range 0 15
     help
       Mouse reports that carry pointer or scroll motion but no button
@@ -278,7 +278,7 @@ config ZMK_ESB_ENDPOINT_POINTER_REFUND_STALE_MS
 
 config ZMK_ESB_ENDPOINT_POINTER_INFLIGHT_CAP
     int "Maximum in-flight pointer-motion HID reports queued to ESB"
-    default 7
+    default 5
     range 1 32
     help
       Cap on the number of mouse motion HID reports that may be sitting
@@ -648,7 +648,7 @@ config ZMK_ESB_ENDPOINT_CHANNEL_QUARANTINE_PERSIST_DECAY_S
 
 config ZMK_ESB_ENDPOINT_CHANNEL_HOP_NEGOTIATE_INTERVAL_MS
     int "Interval between channel-hop negotiation rounds (ms) — steady state"
-    default 60000
+    default 15000
     range 500 60000
     help
       How often the endpoint re-proposes a committed next channel while
@@ -695,7 +695,7 @@ config ZMK_ESB_ENDPOINT_IDLE_THRESHOLD_MS
 
 config ZMK_ESB_ENDPOINT_CHANNEL_HOP_POST_BURST_COUNT
     int "Post-hop PROPOSAL burst count"
-    default 2
+    default 7
     range 0 50
     help
       After a channel hop, the endpoint fires this many PROPOSAL packets
@@ -738,7 +738,7 @@ config ZMK_ESB_ENDPOINT_CHANNEL_HOP_RENDEZVOUS_TIMEOUT_MS
 
 config ZMK_ESB_ENDPOINT_CHANNEL_HOP_RENDEZVOUS_FALLBACK_MS
     int "Force a rendezvous-channel hop after this many ms of post-hop TX failure"
-    default 300
+    default 330
     range 0 10000
     help
       If TX continues to fail for this long after a hop committed (i.e.
@@ -759,7 +759,7 @@ config ZMK_ESB_ENDPOINT_CHANNEL_HOP_RENDEZVOUS_FALLBACK_MS
 
 config ZMK_ESB_ENDPOINT_CHANNEL_HOP_RENDEZVOUS_HOLD_MS
     int "Hold on the rendezvous channel after a fallback before hopping away (ms)"
-    default 1500
+    default 685
     range 0 60000
     depends on ZMK_ESB_ENDPOINT_RENDEZVOUS
     help
@@ -775,7 +775,7 @@ config ZMK_ESB_ENDPOINT_CHANNEL_HOP_RENDEZVOUS_HOLD_MS
 
 config ZMK_ESB_ENDPOINT_CHANNEL_HOP_COOLDOWN_MS
     int "Minimum dwell on the new channel before another hop can fire (ms)"
-    default 305
+    default 360
     range 0 10000
     help
       After a successful channel hop, TX-failure-triggered hops are
@@ -797,7 +797,7 @@ config ZMK_ESB_ENDPOINT_LINK_QUALITY_WINDOW
 
 config ZMK_ESB_ENDPOINT_LINK_QUALITY_NOACK_RING_SIZE
     int "Link-quality noack-tracking ring depth"
-    default 8
+    default 16
     range 2 64
     help
       Capacity of the parallel ring that records the noack flag of each
@@ -810,7 +810,7 @@ config ZMK_ESB_ENDPOINT_LINK_QUALITY_NOACK_RING_SIZE
 
 config ZMK_ESB_ENDPOINT_LINK_DEGRADED_THRESHOLD
     int "Cooperative-hop trigger: retried packets in window"
-    default 3
+    default 5
     range 1 32
     help
       The cooperative-hop handshake fires when at least this many of the
@@ -829,7 +829,7 @@ config ZMK_ESB_ENDPOINT_LINK_DEGRADED_REARM
 
 config ZMK_ESB_ENDPOINT_LINK_DEGRADED_FAST_THRESHOLD
     int "Cooperative-hop trigger: retried packets in last 8"
-    default 2
+    default 3
     range 0 8
     help
       Fast-path trigger: also fire if at least this many of the most
@@ -839,7 +839,7 @@ config ZMK_ESB_ENDPOINT_LINK_DEGRADED_FAST_THRESHOLD
 
 config ZMK_ESB_ENDPOINT_COOP_HOP_HOP_IN_MS
     int "Cooperative hop: delay between OFFER delivery and channel switch (ms)"
-    default 5
+    default 4
     range 2 50
     help
       How long after the HOP_OFFER is delivered both sides wait before
@@ -851,7 +851,7 @@ config ZMK_ESB_ENDPOINT_COOP_HOP_HOP_IN_MS
 
 config ZMK_ESB_ENDPOINT_COOP_HOP_COOLDOWN_MS
     int "Cooperative hop: minimum interval between two coop hops (ms)"
-    default 2500
+    default 1200
     range 100 30000
     help
       After a cooperative hop commits, suppress the next coop trigger

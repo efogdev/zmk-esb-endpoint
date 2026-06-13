@@ -391,6 +391,44 @@ static int cmd_esb_status(const struct shell *sh, const size_t argc, char **argv
     esb_transport_get_hid_tx_stats(&hid_total, &hid_rate);
     shell_print(sh, "HID:      %u Hz (total %u)",
                 (unsigned)hid_rate, (unsigned)hid_total);
+
+#if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_HOP)
+    {
+        shell_print(sh, "");
+
+        struct channel_hop_ep_offender off[16];
+        const uint8_t n = channel_hop_ep_get_offenders(off, ARRAY_SIZE(off));
+        char line[ARRAY_SIZE(off) * 12 + 1];
+        size_t pos;
+        uint8_t shown;
+
+        pos = 0;
+        shown = 0;
+        for (uint8_t i = 0; i < n; i++) {
+            if (!off[i].persistent) {
+                continue;
+            }
+            pos += snprintk(line + pos, sizeof(line) - pos, "%s%u(%u)",
+                            shown == 0 ? "" : " ",
+                            (unsigned)off[i].channel, (unsigned)off[i].hits);
+            shown++;
+        }
+        shell_print(sh, "persistently quarantined:  %s", shown > 0 ? line : "<none>");
+
+        pos = 0;
+        shown = 0;
+        for (uint8_t i = 0; i < n; i++) {
+            if (off[i].session_hits == 0) {
+                continue;
+            }
+            pos += snprintk(line + pos, sizeof(line) - pos, "%s%u(%u)",
+                            shown == 0 ? "" : " ",
+                            (unsigned)off[i].channel, (unsigned)off[i].session_hits);
+            shown++;
+        }
+        shell_print(sh, "offenders since boot:   %s", shown > 0 ? line : "<none>");
+    }
+#endif
     return 0;
 }
 

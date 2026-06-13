@@ -59,3 +59,15 @@ uint8_t channel_hop_ep_get_committed(void);
 uint8_t channel_hop_ep_get_quarantine_count(void);
 bool    channel_hop_ep_is_quarantined(uint8_t channel);
 bool    channel_hop_ep_is_active(void);
+
+struct channel_hop_ep_offender {
+    uint8_t  channel;
+    uint16_t hits;          /* total evidence, incl. the baseline restored from NVS */
+    uint16_t session_hits;  /* condemnations recorded since this boot */
+    bool     persistent;    /* currently in the persisted avoided set */
+};
+
+/* Fills `out` with up to `max` known-offender channels (those condemned by
+ * fail-driven hops), ordered by hit count descending. Returns the number
+ * written. Always 0 unless CHANNEL_QUARANTINE_PERSIST is built in. */
+uint8_t channel_hop_ep_get_offenders(struct channel_hop_ep_offender *out, uint8_t max);

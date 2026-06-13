@@ -75,6 +75,13 @@ static bool m_committed_synced;
  * benign (stale read at worst skips a revert). */
 static volatile uint8_t m_prev_channel = CHANNEL_HOP_INVALID;
 
+/* Last non-default channel we held. Unlike m_prev_channel this is not
+ * cleared on TX success or revert — it is the fallback target for a hop
+ * that has no committed_next while already sitting on the rendezvous
+ * channel, so the pair can oscillate between two predictable points.
+ * Workqueue-only access (hop_work / commit_hop_bookkeeping). */
+static uint8_t m_prev_known_channel = CHANNEL_HOP_INVALID;
+
 /* Active vs idle. Starts ACTIVE on connect; transitions to IDLE after
  * IDLE_THRESHOLD_MS of no user TX. A user TX while idle sends us back to
  * active (no explicit packet — whatever the user TX is serves as the
@@ -241,6 +248,7 @@ static void coop_hop_abort(void);
 struct hit_entry {
     uint8_t  channel;
     uint16_t hits;
+    uint16_t session_hits;
 };
 static struct hit_entry m_hits[HIT_TABLE_SIZE];
 static uint8_t m_hit_count;
@@ -271,7 +279,7 @@ static uint8_t m_saved_off[PERSIST_OFF_MAX];
 static uint8_t m_saved_off_len;
 
 static uint8_t persist_n(void) {
-    uint8_t n = (uint8_t)ZRC_GET(PERSIST_ZRC_KEY, PERSIST_N_MAX);
+    const uint8_t n = (uint8_t)ZRC_GET(PERSIST_ZRC_KEY, PERSIST_N_MAX);
     return n > PERSIST_N_MAX ? PERSIST_N_MAX : n;
 }
 
@@ -290,7 +298,7 @@ static uint32_t persist_decay_period_min(void) {
  * present, append while there is room, otherwise overwrite the
  * least-offending slot and inherit its count + 1 so a genuinely bad
  * newcomer can still climb past stale entries. */
-static void persist_record_hit(uint8_t channel) {
+static void persist_record_hit(const uint8_t channel) {
     if (channel >= CHANNEL_HOP_CHANNEL_COUNT) {
         return;
     }
@@ -299,12 +307,16 @@ static void persist_record_hit(uint8_t channel) {
             if (m_hits[i].hits < UINT16_MAX) {
                 m_hits[i].hits++;
             }
+            if (m_hits[i].session_hits < UINT16_MAX) {
+                m_hits[i].session_hits++;
+            }
             return;
         }
     }
     if (m_hit_count < ARRAY_SIZE(m_hits)) {
         m_hits[m_hit_count].channel = channel;
         m_hits[m_hit_count].hits = 1;
+        m_hits[m_hit_count].session_hits = 1;
         m_hit_count++;
         return;
     }
@@ -318,12 +330,13 @@ static void persist_record_hit(uint8_t channel) {
     if (m_hits[min_i].hits < UINT16_MAX) {
         m_hits[min_i].hits++;
     }
+    m_hits[min_i].session_hits = 1;
 }
 
 /* A channel we are deliberately reoccupying (revert / rendezvous): drop its
  * evidence and remove it from the live avoided set so the picker and its
  * buffer stop fighting the move. The next distill persists the change. */
-static void persist_reclaim(uint8_t channel) {
+static void persist_reclaim(const uint8_t channel) {
     for (uint8_t i = 0; i < m_hit_count; i++) {
         if (m_hits[i].channel == channel) {
             m_hits[i] = m_hits[--m_hit_count];
@@ -414,11 +427,13 @@ static void persist_work_fn(struct k_work *w) {
  * so decay is the only thing that erodes it: once it falls back below the
  * threshold the next rebuild removes it from the avoided set and it becomes
  * pickable — and re-testable — again. */
-static void persist_decay_apply(uint32_t periods) {
+static void persist_decay_apply(const uint32_t periods) {
     uint8_t w = 0;
     for (uint8_t i = 0; i < m_hit_count; i++) {
         if (m_hits[i].hits > periods) {
             m_hits[i].hits = (uint16_t)(m_hits[i].hits - periods);
+            m_hits[i].session_hits = m_hits[i].session_hits > periods
+                ? (uint16_t)(m_hits[i].session_hits - periods) : 0;
             m_hits[w++] = m_hits[i];
         }
     }
@@ -462,8 +477,8 @@ static void persist_decay_check(void) {
     }
 }
 
-static int persist_settings_load_cb(const char *name, size_t len,
-                                    settings_read_cb read_cb, void *cb_arg) {
+static int persist_settings_load_cb(const char *name, const size_t len,
+                                    const settings_read_cb read_cb, void *cb_arg) {
     if (!settings_name_steq(name, "quar", NULL)) {
         return 0;
     }
@@ -493,6 +508,7 @@ static int persist_settings_load_cb(const char *name, size_t len,
         if (m_hit_count < ARRAY_SIZE(m_hits)) {
             m_hits[m_hit_count].channel = ch;
             m_hits[m_hit_count].hits = hits ? hits : 1;
+            m_hits[m_hit_count].session_hits = 0;
             m_hit_count++;
         }
     }
@@ -557,7 +573,7 @@ static uint8_t select_pending_candidate(void) {
     return m_pending_candidate;
 }
 
-static void send_proposal(uint8_t candidate) {
+static void send_proposal(const uint8_t candidate) {
     struct esb_pkt_channel_hop_proposal pkt = {
         .type     = ESB_PKT_CHANNEL_HOP_PROPOSAL,
         .proposed = candidate,
@@ -828,7 +844,7 @@ static void start_post_hop_burst(void) {
                       K_MSEC(CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_HOP_POST_QUIET_MS));
 }
 
-static void enter_active_state(bool send_initial_proposal) {
+static void enter_active_state(const bool send_initial_proposal) {
     if (m_active) {
         /* Already active — just refresh the idle deadline. */
         k_work_reschedule(&idle_check_work,
@@ -889,8 +905,12 @@ static void hop_retry_work_fn(struct k_work *w) {
  * cases — clearing quarantine on the target, etc.); this helper only
  * implements the common tail. Coop hop has no revert / rendezvous
  * concept, so it calls this directly. */
-static void commit_hop_bookkeeping(uint8_t prev, uint32_t quarantine_ms) {
+static void commit_hop_bookkeeping(const uint8_t prev, const uint32_t quarantine_ms) {
     quarantine_add(&m_quarantine, prev, quarantine_ms);
+
+    if (prev != esb_transport_get_rendezvous_channel()) {
+        m_prev_known_channel = prev;
+    }
 
     m_committed_next = CHANNEL_HOP_INVALID;
     m_committed_synced = false;
@@ -955,23 +975,33 @@ static void hop_work_fn(struct k_work *w) {
         target = m_committed_next;
         if (target == CHANNEL_HOP_INVALID || target == current) {
             /* No valid pre-negotiated channel (either CONFIRM never arrived,
-             * or committed_next happened to match our current channel — e.g.
-             * after a prior hop on a noisy link). Picking on the fly is
-             * strictly better than staying on a bad channel: the dongle's
-             * speculative hop + rollback will locate us on the new channel
-             * even though it wasn't pre-confirmed. */
-            target = channel_hop_pick(
-                &m_quarantine,
-                CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_QUARANTINE_MIN_DISTANCE,
-                current);
-            if (target == CHANNEL_HOP_INVALID) {
-                LOG_WRN("no candidate channel available; staying on %u", current);
-                /* Clear the fail counter so the modulo trigger in the TX
-                 * ISR will rearm after the next THRESHOLD failures. */
-                esb_transport_reset_consecutive_fail();
-                return;
+             * or committed_next happened to match our current channel). Don't
+             * scatter to a random channel a desynced dongle can't predict —
+             * converge on the rendezvous (default) channel, which the
+             * dongle's rollback dwell always visits. If already on it, bounce
+             * to the last non-default channel we held so the pair oscillates
+             * between two predictable points instead of one dead rendezvous;
+             * fall back to a fresh pick only when neither is available. */
+            const uint8_t rendezvous = esb_transport_get_rendezvous_channel();
+            if (current != rendezvous) {
+                target = rendezvous;
+            } else if (m_prev_known_channel != CHANNEL_HOP_INVALID &&
+                       m_prev_known_channel != current) {
+                target = m_prev_known_channel;
+            } else {
+                target = channel_hop_pick(
+                    &m_quarantine,
+                    CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_QUARANTINE_MIN_DISTANCE,
+                    current);
+                if (target == CHANNEL_HOP_INVALID) {
+                    LOG_WRN("no candidate channel available; staying on %u", current);
+                    /* Clear the fail counter so the modulo trigger in the TX
+                     * ISR will rearm after the next THRESHOLD failures. */
+                    esb_transport_reset_consecutive_fail();
+                    return;
+                }
             }
-            LOG_WRN("no committed next; picked %u on the fly", target);
+            LOG_WRN("no committed next; hop %u -> %u", current, target);
         }
     }
 
@@ -1202,6 +1232,7 @@ void channel_hop_ep_init(void) {
     m_committed_next = CHANNEL_HOP_INVALID;
     m_committed_synced = false;
     m_prev_channel = CHANNEL_HOP_INVALID;
+    m_prev_known_channel = CHANNEL_HOP_INVALID;
     m_active = false;
     m_post_hop_burst_remaining = 0;
     m_hop_cooldown_until = 0;
@@ -1243,6 +1274,7 @@ void channel_hop_ep_on_disconnected(void) {
     m_committed_next = CHANNEL_HOP_INVALID;
     m_committed_synced = false;
     m_prev_channel = CHANNEL_HOP_INVALID;
+    m_prev_known_channel = CHANNEL_HOP_INVALID;
     m_post_hop_burst_remaining = 0;
     m_hop_cooldown_until = 0;
     m_last_link_event_ms = 0;
@@ -1270,7 +1302,7 @@ void channel_hop_ep_note_user_tx(void) {
     enter_active_state(false);
 }
 
-void channel_hop_ep_on_rx(const uint8_t *data, uint8_t len) {
+void channel_hop_ep_on_rx(const uint8_t *data, const uint8_t len) {
     if (len < 1) {
         return;
     }
@@ -1501,8 +1533,44 @@ uint8_t channel_hop_ep_get_quarantine_count(void) {
     return quarantine_count(&m_quarantine);
 }
 
-bool channel_hop_ep_is_quarantined(uint8_t channel) {
+bool channel_hop_ep_is_quarantined(const uint8_t channel) {
     return quarantine_is(&m_quarantine, channel);
+}
+
+uint8_t channel_hop_ep_get_offenders(struct channel_hop_ep_offender *out, const uint8_t max) {
+#if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_QUARANTINE_PERSIST)
+    if (out == NULL || max == 0) {
+        return 0;
+    }
+    bool used[ARRAY_SIZE(m_hits)] = { false };
+    uint8_t out_n = 0;
+    while (out_n < max) {
+        uint8_t best = 0xFF;
+        for (uint8_t i = 0; i < m_hit_count; i++) {
+            if (used[i]) {
+                continue;
+            }
+            if (best == 0xFF || m_hits[i].hits > m_hits[best].hits) {
+                best = i;
+            }
+        }
+        if (best == 0xFF) {
+            break;
+        }
+        used[best] = true;
+        out[out_n].channel = m_hits[best].channel;
+        out[out_n].hits = m_hits[best].hits;
+        out[out_n].session_hits = m_hits[best].session_hits;
+        out[out_n].persistent =
+            persistent_quarantine_contains(&m_quarantine.persistent, m_hits[best].channel);
+        out_n++;
+    }
+    return out_n;
+#else
+    ARG_UNUSED(out);
+    ARG_UNUSED(max);
+    return 0;
+#endif
 }
 
 #else /* !CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_HOP */
@@ -1519,5 +1587,8 @@ uint8_t channel_hop_ep_get_committed(void) { return CHANNEL_HOP_INVALID; }
 uint8_t channel_hop_ep_get_quarantine_count(void) { return 0; }
 bool channel_hop_ep_is_quarantined(uint8_t channel) { ARG_UNUSED(channel); return false; }
 bool channel_hop_ep_is_active(void) { return false; }
+uint8_t channel_hop_ep_get_offenders(struct channel_hop_ep_offender *out, uint8_t max) {
+    ARG_UNUSED(out); ARG_UNUSED(max); return 0;
+}
 
 #endif /* CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_HOP */
