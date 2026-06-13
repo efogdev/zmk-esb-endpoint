@@ -504,8 +504,20 @@ static int persist_settings_load_cb(const char *name, const size_t len,
         if (ch >= CHANNEL_HOP_CHANNEL_COUNT) {
             continue;
         }
-        /* Seed the evidence table so the ranking survives the reboot. */
-        if (m_hit_count < ARRAY_SIZE(m_hits)) {
+        /* Seed the evidence table so the ranking survives the reboot. The
+         * settings subsystem may replay a superseded copy of the record, so
+         * merge by channel rather than appending blindly. */
+        uint8_t j = 0;
+        for (; j < m_hit_count; j++) {
+            if (m_hits[j].channel == ch) {
+                break;
+            }
+        }
+        if (j < m_hit_count) {
+            if (hits > m_hits[j].hits) {
+                m_hits[j].hits = hits;
+            }
+        } else if (m_hit_count < ARRAY_SIZE(m_hits)) {
             m_hits[m_hit_count].channel = ch;
             m_hits[m_hit_count].hits = hits ? hits : 1;
             m_hits[m_hit_count].session_hits = 0;
@@ -1171,7 +1183,7 @@ static void coop_hop_commit_work_fn(struct k_work *w) {
 
     const int err = esb_transport_set_channel(target);
     if (err) {
-        LOG_ERR("coop hop %u -> %u set_channel failed: %d", current, target, err);
+        LOG_WRN("coop hop %u -> %u set_channel failed: %d (will retry in %d ms)", current, target, err, CONFIG_ZMK_ESB_ENDPOINT_HOP_RETRY_DELAY_MS);
         m_coop_hop_state = COOP_IDLE;
         /* Reuse the existing retry path — the TX-fail trigger will
          * re-fire if the link is genuinely bad. */
