@@ -9,8 +9,10 @@
 #include "channel_hop_ep.h"
 #include "esb_transport.h"
 
-#if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_QUARANTINE_PERSIST)
+#if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_QUARANTINE_PERSIST) || IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_RSSI_WEIGHT)
 #include <zephyr/settings/settings.h>
+#endif
+#if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_QUARANTINE_PERSIST)
 #if IS_ENABLED(CONFIG_ZMK_RUNTIME_CONFIG)
 #include <zmk_runtime_config/runtime_config.h>
 #else
@@ -51,7 +53,20 @@ BUILD_ASSERT(CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_HOP_RENDEZVOUS_TIMEOUT_MS <
              "RENDEZVOUS_TIMEOUT_MS must be < POST_BURST_INTERVAL_MS so the "
              "rendezvous side-trip cannot stall past the next burst tick");
 
+#if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_RSSI_WEIGHT)
+BUILD_ASSERT(CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_RSSI_WEIGHT_MAX >
+             CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_RSSI_WEIGHT_MIN,
+             "RSSI_WEIGHT_MAX must exceed RSSI_WEIGHT_MIN");
+BUILD_ASSERT(CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_RSSI_EWMA_ALPHA <=
+             CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_RSSI_WEIGHT_SCALE,
+             "RSSI_EWMA_ALPHA must not exceed RSSI_WEIGHT_SCALE");
+#endif
+
 static struct quarantine_state m_quarantine;
+
+/* Per-channel RSSI EWMA, stored as signed dBm (negative; higher == stronger).
+ * Address-taken even when RSSI weighting is off, where the picker ignores it. */
+static struct channel_rssi_state m_channel_rssi;
 static uint8_t m_committed_next = CHANNEL_HOP_INVALID;
 static bool m_link_up;
 
@@ -299,7 +314,7 @@ static uint32_t persist_decay_period_min(void) {
  * least-offending slot and inherit its count + 1 so a genuinely bad
  * newcomer can still climb past stale entries. */
 static void persist_record_hit(const uint8_t channel) {
-    if (channel >= CHANNEL_HOP_CHANNEL_COUNT) {
+    if (channel >= CHANNEL_HOP_CHANNEL_COUNT || channel == esb_transport_get_rendezvous_channel()) {
         return;
     }
     for (uint8_t i = 0; i < m_hit_count; i++) {
@@ -367,8 +382,7 @@ static void persist_rebuild_avoided(void) {
     while (out < n_max) {
         uint8_t best = 0xFF;
         for (uint8_t i = 0; i < m_hit_count; i++) {
-            if (used[i] ||
-                m_hits[i].hits < CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_QUARANTINE_PERSIST_THRESHOLD) {
+            if (used[i] || m_hits[i].hits < CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_QUARANTINE_PERSIST_THRESHOLD || m_hits[i].channel == esb_transport_get_rendezvous_channel()) {
                 continue;
             }
             if (best == 0xFF || m_hits[i].hits > m_hits[best].hits) {
@@ -477,59 +491,104 @@ static void persist_decay_check(void) {
     }
 }
 
+#else
+static inline void persist_record_hit(uint8_t channel) { ARG_UNUSED(channel); }
+static inline void persist_reclaim(uint8_t channel) { ARG_UNUSED(channel); }
+static inline void persist_decay_check(void) {}
+#endif /* CHANNEL_QUARANTINE_PERSIST */
+
+#if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_RSSI_WEIGHT)
+#define RSSI_SETTINGS_KEY "esb_hop/rssi"
+
+static int8_t m_rssi_saved[CHANNEL_HOP_CHANNEL_COUNT];
+static struct k_work_delayable rssi_persist_work;
+
+static bool rssi_buf_changed(void) {
+    return memcmp(m_channel_rssi.ewma, m_rssi_saved, CHANNEL_HOP_CHANNEL_COUNT) != 0;
+}
+
+static void rssi_write(void) {
+    settings_save_one(RSSI_SETTINGS_KEY, m_channel_rssi.ewma, CHANNEL_HOP_CHANNEL_COUNT);
+    memcpy(m_rssi_saved, m_channel_rssi.ewma, CHANNEL_HOP_CHANNEL_COUNT);
+}
+
+static void rssi_persist_work_fn(struct k_work *w) {
+    ARG_UNUSED(w);
+    if (rssi_buf_changed()) {
+        rssi_write();
+    }
+    k_work_reschedule(&rssi_persist_work,
+                      K_MSEC(CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_RSSI_PERSIST_INTERVAL_MS));
+}
+#endif /* CHANNEL_RSSI_WEIGHT */
+
+#if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_QUARANTINE_PERSIST) || IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_RSSI_WEIGHT)
 static int persist_settings_load_cb(const char *name, const size_t len,
                                     const settings_read_cb read_cb, void *cb_arg) {
-    if (!settings_name_steq(name, "quar", NULL)) {
-        return 0;
-    }
-    if (len < 3 || len > PERSIST_REC_MAX) {
-        LOG_WRN("unexpected quarantine record length %zu, dropping", len);
-        return 0;
-    }
-    uint8_t buf[PERSIST_REC_MAX];
-    if (read_cb(cb_arg, buf, len) < 0) {
-        return 0;
-    }
-    m_decay_accum_min = (uint16_t)buf[0] | ((uint16_t)buf[1] << 8);
+#if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_QUARANTINE_PERSIST)
+    if (settings_name_steq(name, "quar", NULL)) {
+        if (len < 3 || len > PERSIST_REC_MAX) {
+            LOG_DBG("unexpected quarantine record length %zu, dropping", len);
+            return 0;
+        }
+        uint8_t buf[PERSIST_REC_MAX];
+        if (read_cb(cb_arg, buf, len) < 0) {
+            return 0;
+        }
+        m_decay_accum_min = (uint16_t)buf[0] | ((uint16_t)buf[1] << 8);
 
-    const uint8_t *off = &buf[2];
-    const size_t off_len = len - 2;
-    uint8_t stored = off[0];
-    if ((size_t)(1 + stored * 3) > off_len) {
-        stored = (uint8_t)((off_len - 1) / 3);
-    }
-    for (uint8_t i = 0; i < stored; i++) {
-        const uint8_t ch = off[1 + i * 3];
-        const uint16_t hits = (uint16_t)off[2 + i * 3] | ((uint16_t)off[3 + i * 3] << 8);
-        if (ch >= CHANNEL_HOP_CHANNEL_COUNT) {
-            continue;
+        const uint8_t *off = &buf[2];
+        const size_t off_len = len - 2;
+        uint8_t stored = off[0];
+        if ((size_t)(1 + stored * 3) > off_len) {
+            stored = (uint8_t)((off_len - 1) / 3);
         }
-        /* Seed the evidence table so the ranking survives the reboot. The
-         * settings subsystem may replay a superseded copy of the record, so
-         * merge by channel rather than appending blindly. */
-        uint8_t j = 0;
-        for (; j < m_hit_count; j++) {
-            if (m_hits[j].channel == ch) {
-                break;
+        for (uint8_t i = 0; i < stored; i++) {
+            const uint8_t ch = off[1 + i * 3];
+            const uint16_t hits = (uint16_t)off[2 + i * 3] | ((uint16_t)off[3 + i * 3] << 8);
+            if (ch >= CHANNEL_HOP_CHANNEL_COUNT) {
+                continue;
+            }
+            /* Seed the evidence table so the ranking survives the reboot. The
+             * settings subsystem may replay a superseded copy of the record, so
+             * merge by channel rather than appending blindly. */
+            uint8_t j = 0;
+            for (; j < m_hit_count; j++) {
+                if (m_hits[j].channel == ch) {
+                    break;
+                }
+            }
+            if (j < m_hit_count) {
+                if (hits > m_hits[j].hits) {
+                    m_hits[j].hits = hits;
+                }
+            } else if (m_hit_count < ARRAY_SIZE(m_hits)) {
+                m_hits[m_hit_count].channel = ch;
+                m_hits[m_hit_count].hits = hits ? hits : 1;
+                m_hits[m_hit_count].session_hits = 0;
+                m_hit_count++;
             }
         }
-        if (j < m_hit_count) {
-            if (hits > m_hits[j].hits) {
-                m_hits[j].hits = hits;
-            }
-        } else if (m_hit_count < ARRAY_SIZE(m_hits)) {
-            m_hits[m_hit_count].channel = ch;
-            m_hits[m_hit_count].hits = hits ? hits : 1;
-            m_hits[m_hit_count].session_hits = 0;
-            m_hit_count++;
-        }
+        return 0;
     }
+#endif
+#if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_RSSI_WEIGHT)
+    if (settings_name_steq(name, "rssi", NULL)) {
+        if (len != CHANNEL_HOP_CHANNEL_COUNT) {
+            LOG_DBG("unexpected rssi record length %zu, dropping", len);
+            return 0;
+        }
+        read_cb(cb_arg, m_channel_rssi.ewma, CHANNEL_HOP_CHANNEL_COUNT);
+        return 0;
+    }
+#endif
     return 0;
 }
 
 SETTINGS_STATIC_HANDLER_DEFINE(esb_hop, "esb_hop", NULL, persist_settings_load_cb, NULL, NULL);
 
 static void persist_load(void) {
+#if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_QUARANTINE_PERSIST)
     m_hit_count = 0;
     m_off_len = 0;
     m_saved_off_len = 0;
@@ -540,8 +599,10 @@ static void persist_load(void) {
 #if IS_ENABLED(CONFIG_ZMK_RUNTIME_CONFIG)
     zrc_register(PERSIST_ZRC_KEY, PERSIST_N_MAX, 0, PERSIST_N_MAX);
 #endif
+#endif
     settings_subsys_init();
     settings_load_subtree("esb_hop");
+#if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_QUARANTINE_PERSIST)
     /* Build the avoided set from whatever was seeded and snapshot the
      * on-flash state so the first distill / flush doesn't rewrite it. */
     persist_rebuild_avoided();
@@ -554,18 +615,21 @@ static void persist_load(void) {
                       K_MSEC(CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_QUARANTINE_PERSIST_INTERVAL_MS));
     /* Boot check: a full period may already have elapsed across prior runs. */
     persist_decay_check();
+#endif
+#if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_RSSI_WEIGHT)
+    memcpy(m_rssi_saved, m_channel_rssi.ewma, CHANNEL_HOP_CHANNEL_COUNT);
+    k_work_init_delayable(&rssi_persist_work, rssi_persist_work_fn);
+    k_work_reschedule(&rssi_persist_work,
+                      K_MSEC(CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_RSSI_PERSIST_INTERVAL_MS));
+#endif
 }
-#else
-static inline void persist_record_hit(uint8_t channel) { ARG_UNUSED(channel); }
-static inline void persist_reclaim(uint8_t channel) { ARG_UNUSED(channel); }
-static inline void persist_decay_check(void) {}
-#endif /* CHANNEL_QUARANTINE_PERSIST */
+#endif /* QUARANTINE_PERSIST || RSSI_WEIGHT */
 
 static uint8_t pick_candidate(void) {
     const uint8_t current = esb_transport_get_channel();
-    return channel_hop_pick(&m_quarantine,
-                            CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_QUARANTINE_MIN_DISTANCE,
-                            current);
+    return channel_hop_pick_weighted(&m_quarantine,
+                                     CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_QUARANTINE_MIN_DISTANCE,
+                                     current, &m_channel_rssi);
 }
 
 /* Reuse the cached pending candidate if it is still a valid target;
@@ -639,7 +703,7 @@ static void negotiate_work_fn(struct k_work *w) {
         if (candidate != CHANNEL_HOP_INVALID) {
             send_proposal(candidate);
         } else {
-            LOG_WRN("no candidate channel available");
+            LOG_DBG("no candidate channel available");
         }
     } else if (!m_committed_synced) {
         /* committed_next is valid but the dongle has signalled (REQUEST)
@@ -918,9 +982,10 @@ static void hop_retry_work_fn(struct k_work *w) {
  * implements the common tail. Coop hop has no revert / rendezvous
  * concept, so it calls this directly. */
 static void commit_hop_bookkeeping(const uint8_t prev, const uint32_t quarantine_ms) {
-    quarantine_add(&m_quarantine, prev, quarantine_ms);
-
+    /* Never quarantine the rendezvous channel — it must stay a usable
+     * fallback for re-syncing with a desynced dongle. */
     if (prev != esb_transport_get_rendezvous_channel()) {
+        quarantine_add(&m_quarantine, prev, quarantine_ms);
         m_prev_known_channel = prev;
     }
 
@@ -985,9 +1050,12 @@ static void hop_work_fn(struct k_work *w) {
         target = prev;
     } else {
         target = m_committed_next;
-        if (target == CHANNEL_HOP_INVALID || target == current) {
-            /* No valid pre-negotiated channel (either CONFIRM never arrived,
-             * or committed_next happened to match our current channel). Don't
+        if (target == CHANNEL_HOP_INVALID || target == current ||
+            quarantine_is(&m_quarantine, target)) {
+            /* No valid pre-negotiated channel (CONFIRM never arrived,
+             * committed_next matched our current channel, or it has since
+             * been quarantined — timed expiry or a persistent-offender
+             * rebuild can condemn it after we committed). Don't
              * scatter to a random channel a desynced dongle can't predict —
              * converge on the rendezvous (default) channel, which the
              * dongle's rollback dwell always visits. If already on it, bounce
@@ -1001,19 +1069,19 @@ static void hop_work_fn(struct k_work *w) {
                        m_prev_known_channel != current) {
                 target = m_prev_known_channel;
             } else {
-                target = channel_hop_pick(
+                target = channel_hop_pick_weighted(
                     &m_quarantine,
                     CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_QUARANTINE_MIN_DISTANCE,
-                    current);
+                    current, &m_channel_rssi);
                 if (target == CHANNEL_HOP_INVALID) {
-                    LOG_WRN("no candidate channel available; staying on %u", current);
+                    LOG_DBG("no candidate channel available; staying on %u", current);
                     /* Clear the fail counter so the modulo trigger in the TX
                      * ISR will rearm after the next THRESHOLD failures. */
                     esb_transport_reset_consecutive_fail();
                     return;
                 }
             }
-            LOG_WRN("no committed next; hop %u -> %u", current, target);
+            LOG_DBG("no committed next; hop %u -> %u", current, target);
         }
     }
 
@@ -1044,7 +1112,7 @@ static void hop_work_fn(struct k_work *w) {
         m_quarantine.expires_at[target] = 0;
         persist_reclaim(target);
         m_prev_channel = CHANNEL_HOP_INVALID;
-        LOG_WRN("rendezvous fallback: %u -> %u (cooldown desync recovery)",
+        LOG_DBG("rendezvous fallback: %u -> %u (cooldown desync recovery)",
                 current, target);
 
         m_committed_next = CHANNEL_HOP_INVALID;
@@ -1077,7 +1145,7 @@ static void hop_work_fn(struct k_work *w) {
          * and any persistent-offender record. */
         m_quarantine.expires_at[target] = 0;
         persist_reclaim(target);
-        LOG_WRN("no TX success since last hop; reverted %u -> %u", current, target);
+        LOG_DBG("no TX success since last hop; reverted %u -> %u", current, target);
     }
 
     /* Arm a future revert to `current` only for normal hops. A revert is
@@ -1085,7 +1153,7 @@ static void hop_work_fn(struct k_work *w) {
      * fresh candidate, not bounce again. */
     m_prev_channel = is_revert ? CHANNEL_HOP_INVALID : current;
 
-    LOG_INF("channel hop: %u -> %u (quarantined %u for %ums)",
+    LOG_DBG("channel hop: %u -> %u (quarantined %u for %ums)",
             current, target, current,
             (unsigned)CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_QUARANTINE_MS);
 
@@ -1118,9 +1186,9 @@ static uint8_t coop_hop_pick_target(void) {
         !quarantine_is(&m_quarantine, m_committed_next)) {
         return m_committed_next;
     }
-    return channel_hop_pick(&m_quarantine,
-                            CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_QUARANTINE_MIN_DISTANCE,
-                            current);
+    return channel_hop_pick_weighted(&m_quarantine,
+                                     CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_QUARANTINE_MIN_DISTANCE,
+                                     current, &m_channel_rssi);
 }
 
 static void coop_hop_offer_work_fn(struct k_work *w) {
@@ -1137,7 +1205,7 @@ static void coop_hop_offer_work_fn(struct k_work *w) {
 
     const uint8_t target = coop_hop_pick_target();
     if (target == CHANNEL_HOP_INVALID || target == esb_transport_get_channel()) {
-        LOG_WRN("coop hop: no candidate channel; aborting");
+        LOG_DBG("coop hop: no candidate channel; aborting");
         m_coop_hop_state = COOP_IDLE;
         return;
     }
@@ -1158,12 +1226,12 @@ static void coop_hop_offer_work_fn(struct k_work *w) {
     m_last_tx_was_offer = true;
     const int err = esb_transport_send(ESB_PIPE_DATA, (uint8_t *)&pkt, sizeof(pkt));
     if (err) {
-        LOG_WRN("coop OFFER send failed: %d", err);
+        LOG_DBG("coop OFFER send failed: %d", err);
         m_last_tx_was_offer = false;
         m_coop_hop_state = COOP_IDLE;
         return;
     }
-    LOG_INF("coop hop OFFER: target=%u hop_in=%ums seq=%u",
+    LOG_DBG("coop hop OFFER: target=%u hop_in=%ums seq=%u",
             target, pkt.hop_in_ms, m_coop_hop_seq);
 }
 
@@ -1183,7 +1251,7 @@ static void coop_hop_commit_work_fn(struct k_work *w) {
 
     const int err = esb_transport_set_channel(target);
     if (err) {
-        LOG_WRN("coop hop %u -> %u set_channel failed: %d (will retry in %d ms)", current, target, err, CONFIG_ZMK_ESB_ENDPOINT_HOP_RETRY_DELAY_MS);
+        LOG_DBG("coop hop %u -> %u set_channel failed: %d (will retry in %d ms)", current, target, err, CONFIG_ZMK_ESB_ENDPOINT_HOP_RETRY_DELAY_MS);
         m_coop_hop_state = COOP_IDLE;
         /* Reuse the existing retry path — the TX-fail trigger will
          * re-fire if the link is genuinely bad. */
@@ -1191,7 +1259,7 @@ static void coop_hop_commit_work_fn(struct k_work *w) {
         return;
     }
 
-    LOG_INF("coop hop committed: %u -> %u (quarantined %u for %ums)",
+    LOG_DBG("coop hop committed: %u -> %u (quarantined %u for %ums)",
             current, target, current,
             (unsigned)CONFIG_ZMK_ESB_ENDPOINT_COOP_HOP_QUARANTINE_MS);
     m_prev_channel = CHANNEL_HOP_INVALID;
@@ -1238,7 +1306,8 @@ void channel_hop_ep_on_link_degraded_isr(void) {
 
 void channel_hop_ep_init(void) {
     quarantine_reset(&m_quarantine);
-#if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_QUARANTINE_PERSIST)
+    channel_rssi_reset(&m_channel_rssi);
+#if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_QUARANTINE_PERSIST) || IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_RSSI_WEIGHT)
     persist_load();
 #endif
     m_committed_next = CHANNEL_HOP_INVALID;
@@ -1274,6 +1343,10 @@ void channel_hop_ep_init(void) {
 
 void channel_hop_ep_on_connected(void) {
     m_link_up = true;
+    /* The rendezvous channel is only known once addresses are configured,
+     * after persist_load's rebuild ran — drop it from the evidence table
+     * and avoided set in case a stale NVS record promoted it. */
+    persist_reclaim(esb_transport_get_rendezvous_channel());
     /* Start ACTIVE so the first PROPOSAL goes out immediately and we have
      * a committed_next available the first time TX failures hit the hop
      * threshold. idle_check_work will demote us if no HID follows. */
@@ -1342,7 +1415,7 @@ void channel_hop_ep_on_rx(const uint8_t *data, const uint8_t len) {
             return;
         }
         if (a->agreed_channel != m_coop_hop_target) {
-            LOG_INF("coop ACCEPT counter-proposed: %u -> %u",
+            LOG_DBG("coop ACCEPT counter-proposed: %u -> %u",
                     m_coop_hop_target, a->agreed_channel);
             m_coop_hop_target = a->agreed_channel;
         }
@@ -1358,6 +1431,22 @@ void channel_hop_ep_on_rx(const uint8_t *data, const uint8_t len) {
     }
     const struct esb_pkt_channel_hop_confirm *c = (const void *)data;
     if (c->agreed >= CHANNEL_HOP_CHANNEL_COUNT) {
+        return;
+    }
+    /* Reject a dongle-agreed channel we quarantine. Committing it would let
+     * the next TX-fail hop jump straight onto a known-bad channel (the hop
+     * target is taken from m_committed_next unconditionally). Leave
+     * committed_next untouched and re-seed a PROPOSAL burst so the dongle is
+     * pushed toward a channel we both accept; our PROPOSALs only ever carry
+     * non-quarantined picks, so a counter-proposal cannot recur on it. */
+    if (quarantine_is(&m_quarantine, c->agreed)) {
+        LOG_DBG("rejecting agreed channel %u: quarantined", c->agreed);
+        m_committed_synced = false;
+        if (m_link_up && m_active) {
+            m_request_burst_remaining =
+                CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_HOP_REQUEST_BURST_COUNT;
+            k_work_reschedule(&negotiate_work, K_NO_WAIT);
+        }
         return;
     }
     const bool was_missing = (m_committed_next == CHANNEL_HOP_INVALID);
@@ -1410,7 +1499,7 @@ void channel_hop_ep_on_request(void) {
      * to actually transmit the PROPOSAL instead of skipping it. */
     m_committed_synced = false;
     k_work_reschedule(&negotiate_work, K_NO_WAIT);
-    LOG_INF("REQUEST received — burst of %u PROPOSAL attempts",
+    LOG_DBG("REQUEST received — burst of %u PROPOSAL attempts",
             m_request_burst_remaining);
 
     /* Respond by re-proposing only — never by hopping. A REQUEST means the
@@ -1585,6 +1674,36 @@ uint8_t channel_hop_ep_get_offenders(struct channel_hop_ep_offender *out, const 
 #endif
 }
 
+#if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_RSSI_WEIGHT)
+void channel_hop_ep_note_peer_rssi(const int8_t ewma) {
+    /* The dongle reports RSSI as a positive magnitude (|dBm|); store the true
+     * negative dBm so stronger maps to larger and the +127 no-sample sentinel
+     * cannot collide with a real reading. */
+    channel_rssi_update(&m_channel_rssi, esb_transport_get_channel(), (int8_t)-ewma);
+}
+
+uint8_t channel_hop_ep_get_rssi(struct channel_hop_ep_rssi *out, const uint8_t max) {
+    if (out == NULL || max == 0) {
+        return 0;
+    }
+    uint8_t n = 0;
+    for (uint8_t ch = 0; ch < CHANNEL_HOP_CHANNEL_COUNT && n < max; ch++) {
+        int8_t v;
+        if (channel_rssi_get(&m_channel_rssi, ch, &v)) {
+            out[n].channel = ch;
+            out[n].ewma = v;
+            n++;
+        }
+    }
+    return n;
+}
+#else
+void channel_hop_ep_note_peer_rssi(int8_t ewma) { ARG_UNUSED(ewma); }
+uint8_t channel_hop_ep_get_rssi(struct channel_hop_ep_rssi *out, uint8_t max) {
+    ARG_UNUSED(out); ARG_UNUSED(max); return 0;
+}
+#endif
+
 #else /* !CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_HOP */
 
 void channel_hop_ep_init(void) {}
@@ -1600,6 +1719,10 @@ uint8_t channel_hop_ep_get_quarantine_count(void) { return 0; }
 bool channel_hop_ep_is_quarantined(uint8_t channel) { ARG_UNUSED(channel); return false; }
 bool channel_hop_ep_is_active(void) { return false; }
 uint8_t channel_hop_ep_get_offenders(struct channel_hop_ep_offender *out, uint8_t max) {
+    ARG_UNUSED(out); ARG_UNUSED(max); return 0;
+}
+void channel_hop_ep_note_peer_rssi(int8_t ewma) { ARG_UNUSED(ewma); }
+uint8_t channel_hop_ep_get_rssi(struct channel_hop_ep_rssi *out, uint8_t max) {
     ARG_UNUSED(out); ARG_UNUSED(max); return 0;
 }
 

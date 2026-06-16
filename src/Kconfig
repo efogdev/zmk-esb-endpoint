@@ -646,6 +646,39 @@ config ZMK_ESB_ENDPOINT_CHANNEL_QUARANTINE_PERSIST_DECAY_S
       on every speculative hop. 0 disables decay (offenders are remembered
       until evicted or reclaimed).
 
+config ZMK_ESB_ENDPOINT_CHANNEL_RSSI_WEIGHT
+    bool "Weight channel picking by per-channel RSSI EWMA"
+    default y
+
+if ZMK_ESB_ENDPOINT_CHANNEL_RSSI_WEIGHT
+
+config ZMK_ESB_ENDPOINT_CHANNEL_RSSI_WEIGHT_SCALE
+    int "Fixed-point scale for RSSI weights and EWMA alpha"
+    default 1000
+    range 10 100000
+
+config ZMK_ESB_ENDPOINT_CHANNEL_RSSI_WEIGHT_MIN
+    int "Selection weight of the worst-RSSI candidate (xSCALE)"
+    default 500
+    range 1 100000
+
+config ZMK_ESB_ENDPOINT_CHANNEL_RSSI_WEIGHT_MAX
+    int "Selection weight of the best-RSSI candidate (xSCALE)"
+    default 2000
+    range 1 100000
+
+config ZMK_ESB_ENDPOINT_CHANNEL_RSSI_EWMA_ALPHA
+    int "EWMA smoothing factor for per-channel RSSI (xSCALE)"
+    default 200
+    range 1 100000
+
+config ZMK_ESB_ENDPOINT_CHANNEL_RSSI_PERSIST_INTERVAL_MS
+    int "Interval between per-channel RSSI distil + NVS writes (ms)"
+    default 1200000
+    range 1000 3600000
+
+endif # ZMK_ESB_ENDPOINT_CHANNEL_RSSI_WEIGHT
+
 config ZMK_ESB_ENDPOINT_CHANNEL_HOP_NEGOTIATE_INTERVAL_MS
     int "Interval between channel-hop negotiation rounds (ms) — steady state"
     default 15000

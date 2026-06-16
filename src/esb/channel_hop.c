@@ -28,6 +28,37 @@ static uint32_t prng_next(void) {
     return x;
 }
 
+#if defined(CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_RSSI_WEIGHT)
+void channel_rssi_reset(struct channel_rssi_state *r) {
+    for (uint8_t ch = 0; ch < CHANNEL_HOP_CHANNEL_COUNT; ch++) {
+        r->ewma[ch] = CHANNEL_RSSI_NONE;
+    }
+}
+
+void channel_rssi_update(struct channel_rssi_state *r, const uint8_t channel, const int8_t sample) {
+    if (channel >= CHANNEL_HOP_CHANNEL_COUNT) {
+        return;
+    }
+    if (r->ewma[channel] == CHANNEL_RSSI_NONE) {
+        r->ewma[channel] = sample;
+        return;
+    }
+    const int32_t alpha = CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_RSSI_EWMA_ALPHA;
+    const int32_t scale = CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_RSSI_WEIGHT_SCALE;
+    r->ewma[channel] = (int8_t)((alpha * sample + (scale - alpha) * r->ewma[channel]) / scale);
+}
+
+bool channel_rssi_get(const struct channel_rssi_state *r, const uint8_t channel, int8_t *out) {
+    if (channel >= CHANNEL_HOP_CHANNEL_COUNT || r->ewma[channel] == CHANNEL_RSSI_NONE) {
+        return false;
+    }
+    if (out) {
+        *out = r->ewma[channel];
+    }
+    return true;
+}
+#endif /* CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_RSSI_WEIGHT */
+
 #if defined(CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_QUARANTINE_PERSIST)
 bool persistent_quarantine_contains(const struct persistent_quarantine *p, uint8_t channel) {
     for (uint8_t i = 0; i < p->count; i++) {
@@ -133,9 +164,73 @@ static bool within_distance_of_persistent(const struct quarantine_state *q,
 }
 #endif
 
+#if defined(CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_RSSI_WEIGHT)
+/* Draw one candidate index, biased by per-channel RSSI. Candidates with a
+ * sample map linearly onto [WEIGHT_MIN, WEIGHT_MAX] (best RSSI -> MAX);
+ * unsampled candidates take the midpoint. Falls back to a uniform draw when
+ * no candidate carries a sample. */
+static int32_t candidate_weight(const struct channel_rssi_state *rssi, const uint8_t channel,
+                                const int8_t lo, const int8_t hi) {
+    const int32_t w_min = CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_RSSI_WEIGHT_MIN;
+    const int32_t w_max = CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_RSSI_WEIGHT_MAX;
+    int8_t s;
+    if (!channel_rssi_get(rssi, channel, &s) || hi == lo) {
+        return (w_min + w_max) / 2;
+    }
+    return w_min + (w_max - w_min) * (int32_t)(s - lo) / (int32_t)(hi - lo);
+}
+
+static uint8_t weighted_index(const uint8_t *candidates, const uint8_t count,
+                              const struct channel_rssi_state *rssi) {
+    int8_t lo = 0, hi = 0;
+    bool any = false;
+    for (uint8_t i = 0; i < count; i++) {
+        int8_t s;
+        if (!channel_rssi_get(rssi, candidates[i], &s)) {
+            continue;
+        }
+        if (!any) {
+            lo = hi = s;
+            any = true;
+        } else {
+            if (s < lo) lo = s;
+            if (s > hi) hi = s;
+        }
+    }
+    if (!any) {
+        return (uint8_t)(prng_next() % count);
+    }
+
+    /* Two passes (sum, then walk) so no per-candidate weight buffer is needed
+     * on the workqueue stack the picker runs on. */
+    int32_t total = 0;
+    for (uint8_t i = 0; i < count; i++) {
+        total += candidate_weight(rssi, candidates[i], lo, hi);
+    }
+    int32_t r = (int32_t)(prng_next() % (uint32_t)total);
+    for (uint8_t i = 0; i < count; i++) {
+        r -= candidate_weight(rssi, candidates[i], lo, hi);
+        if (r < 0) {
+            return i;
+        }
+    }
+    return (uint8_t)(count - 1);
+}
+#endif /* CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_RSSI_WEIGHT */
+
 uint8_t channel_hop_pick(const struct quarantine_state *q,
                          uint8_t min_distance,
                          uint8_t avoid_channel) {
+    return channel_hop_pick_weighted(q, min_distance, avoid_channel, NULL);
+}
+
+uint8_t channel_hop_pick_weighted(const struct quarantine_state *q,
+                                  uint8_t min_distance,
+                                  uint8_t avoid_channel,
+                                  const struct channel_rssi_state *rssi) {
+#if !defined(CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_RSSI_WEIGHT)
+    ARG_UNUSED(rssi);
+#endif
     uint8_t candidates[CHANNEL_HOP_CHANNEL_COUNT];
 
     /* Try progressively smaller distances. We never accept a quarantined
@@ -180,8 +275,12 @@ uint8_t channel_hop_pick(const struct quarantine_state *q,
             candidates[count++] = ch;
         }
         if (count > 0) {
-            const uint32_t r = prng_next();
-            return candidates[r % count];
+#if defined(CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_RSSI_WEIGHT)
+            if (rssi != NULL) {
+                return candidates[weighted_index(candidates, count, rssi)];
+            }
+#endif
+            return candidates[prng_next() % count];
         }
     }
 

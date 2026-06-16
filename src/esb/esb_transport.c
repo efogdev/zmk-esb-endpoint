@@ -1149,6 +1149,9 @@ void esb_transport_on_rx_link_stats(const uint8_t *data, const uint8_t len) {
     m_peer_rssi_last = s->rssi_last;
     m_peer_rssi_ewma = s->rssi_ewma;
     m_peer_rssi_valid = true;
+#if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_RSSI_WEIGHT)
+    channel_hop_ep_note_peer_rssi(s->rssi_ewma);
+#endif
 }
 
 bool esb_transport_get_peer_rssi(int8_t *last_out, int8_t *ewma_out) {

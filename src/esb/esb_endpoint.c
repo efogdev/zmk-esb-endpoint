@@ -46,9 +46,6 @@ static volatile bool esb_active;
 
 K_THREAD_STACK_DEFINE(esb_ctrl_stack, CONFIG_ZMK_ESB_ENDPOINT_CTRL_STACK_SIZE);
 static struct k_thread esb_ctrl_thread;
-
-#define ESB_CMD_ACTIVATE   1
-#define ESB_CMD_DEACTIVATE 2
 K_MSGQ_DEFINE(esb_ctrl_msgq, sizeof(int), CONFIG_ZMK_ESB_ENDPOINT_CTRL_MSGQ_DEPTH, 4);
 
 bool zmk_esb_endpoint_is_active(void) {
@@ -334,8 +331,7 @@ static int cmd_esb_status(const struct shell *sh, const size_t argc, char **argv
 #if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_HOP)
     const uint8_t cur = esb_transport_get_channel();
     const uint8_t nxt = channel_hop_ep_get_committed();
-    shell_print(sh, "channel:  %u (hop %s)",
-                cur, channel_hop_ep_is_active() ? "active" : "idle");
+    shell_print(sh, "channel:  %u (hop %s)", cur, channel_hop_ep_is_active() ? "active" : "idle");
     if (nxt == CHANNEL_HOP_INVALID) {
         shell_print(sh, "next:     <none>");
     } else {
@@ -358,10 +354,10 @@ static int cmd_esb_status(const struct shell *sh, const size_t argc, char **argv
         uint16_t lq_ewma_x10 = 0;
         esb_transport_get_link_quality(&lq_retried, &lq_ewma_x10);
         shell_print(sh, "link:     ewma=%u.%u attempts, retried=%u/%u in window",
-                    (unsigned)(lq_ewma_x10 / 10u),
-                    (unsigned)(lq_ewma_x10 % 10u),
-                    (unsigned)lq_retried,
-                    (unsigned)CONFIG_ZMK_ESB_ENDPOINT_LINK_QUALITY_WINDOW);
+            (unsigned)(lq_ewma_x10 / 10u),
+            (unsigned)(lq_ewma_x10 % 10u),
+            (unsigned)lq_retried,
+            (unsigned)CONFIG_ZMK_ESB_ENDPOINT_LINK_QUALITY_WINDOW);
     }
 #endif
 
@@ -372,8 +368,7 @@ static int cmd_esb_status(const struct shell *sh, const size_t argc, char **argv
         if (tx_total > 0) {
             /* per-mille so we can render one decimal without floats */
             const uint32_t per_pm   = (tx_exhausted * 1000u) / tx_total;
-            const uint32_t retry_pm = (tx_ok > 0)
-                ? (tx_retried * 1000u) / tx_ok : 0u;
+            const uint32_t retry_pm = (tx_ok > 0) ? (tx_retried * 1000u) / tx_ok : 0u;
             shell_print(sh,
                 "TX:       ok=%u retried=%u (%u.%u%%) failed=%u (PER %u.%u%%)",
                 (unsigned)tx_ok,
@@ -389,8 +384,7 @@ static int cmd_esb_status(const struct shell *sh, const size_t argc, char **argv
     uint32_t hid_total = 0;
     uint16_t hid_rate  = 0;
     esb_transport_get_hid_tx_stats(&hid_total, &hid_rate);
-    shell_print(sh, "HID:      %u Hz (total %u)",
-                (unsigned)hid_rate, (unsigned)hid_total);
+    shell_print(sh, "HID:      %u Hz (total %u)", (unsigned)hid_rate, (unsigned)hid_total);
 
 #if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_HOP)
     {
@@ -408,9 +402,8 @@ static int cmd_esb_status(const struct shell *sh, const size_t argc, char **argv
             if (!off[i].persistent) {
                 continue;
             }
-            pos += snprintk(line + pos, sizeof(line) - pos, "%s%u(%u)",
-                            shown == 0 ? "" : " ",
-                            (unsigned)off[i].channel, (unsigned)off[i].hits);
+            pos += snprintk(line + pos, sizeof(line) - pos, "%s%u(%u)", shown == 0 ? "" : " ",
+                (unsigned)off[i].channel, (unsigned)off[i].hits);
             shown++;
         }
         shell_print(sh, "persistently quarantined:  %s", shown > 0 ? line : "<none>");
@@ -421,12 +414,37 @@ static int cmd_esb_status(const struct shell *sh, const size_t argc, char **argv
             if (off[i].session_hits == 0) {
                 continue;
             }
-            pos += snprintk(line + pos, sizeof(line) - pos, "%s%u(%u)",
-                            shown == 0 ? "" : " ",
-                            (unsigned)off[i].channel, (unsigned)off[i].session_hits);
+            pos += snprintk(line + pos, sizeof(line) - pos, "%s%u(%u)", shown == 0 ? "" : " ",
+                (unsigned)off[i].channel, (unsigned)off[i].session_hits);
             shown++;
         }
-        shell_print(sh, "offenders since boot:   %s", shown > 0 ? line : "<none>");
+        shell_print(sh, "collected since boot:   %s", shown > 0 ? line : "<none>");
+    }
+#endif
+
+#if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_RSSI_WEIGHT)
+    {
+        struct channel_hop_ep_rssi rssi[32];
+        const uint8_t rn = channel_hop_ep_get_rssi(rssi, ARRAY_SIZE(rssi));
+        if (rn == 0) {
+            shell_print(sh, "(in)famous channels:   <none>");
+        } else {
+            char line[8 * 12 + 1];
+            for (uint8_t i = 0; i < rn; ) {
+                const uint8_t end = MIN(i + 8, rn);
+                size_t pos = 0;
+                for (uint8_t j = i; j < end; j++) {
+                    pos += snprintk(line + pos, sizeof(line) - pos, "%s%u(%d)", j == i ? "" : " ",
+                        (unsigned)rssi[j].channel, (int)rssi[j].ewma);
+                }
+                if (i == 0) {
+                    shell_print(sh, "(in)famous channels:   %s", line);
+                } else {
+                    shell_print(sh, "                       %s", line);
+                }
+                i = end;
+            }
+        }
     }
 #endif
     return 0;

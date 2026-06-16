@@ -23,6 +23,20 @@ void channel_hop_ep_on_disconnected(void);
 /* Called from pairing.c's RX dispatch for CHANNEL_HOP_CONFIRM packets. */
 void channel_hop_ep_on_rx(const uint8_t *data, uint8_t len);
 
+/* Fold a dongle-reported peer RSSI EWMA (positive magnitude, per LINK_STATS)
+ * into the current channel's per-channel RSSI tracker. No-op unless
+ * CHANNEL_RSSI_WEIGHT is built in. */
+void channel_hop_ep_note_peer_rssi(int8_t ewma);
+
+struct channel_hop_ep_rssi {
+    uint8_t channel;
+    int8_t  ewma;  /* signed dBm; higher (closer to 0) is stronger */
+};
+
+/* Fills `out` with up to `max` sampled channels ordered strongest-first.
+ * Returns the number written. Always 0 unless CHANNEL_RSSI_WEIGHT is built in. */
+uint8_t channel_hop_ep_get_rssi(struct channel_hop_ep_rssi *out, uint8_t max);
+
 /* Called from pairing.c when a CHANNEL_HOP_REQUEST arrives (dongle's
  * committed_next is INVALID and it wants a fresh PROPOSAL). Schedules
  * negotiate_work to fire immediately so the next outbound TX carries a

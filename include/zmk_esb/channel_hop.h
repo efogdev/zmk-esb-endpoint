@@ -12,9 +12,36 @@
 #include <stdint.h>
 #include <stdbool.h>
 
+#define ESB_CMD_ACTIVATE   1
+#define ESB_CMD_DEACTIVATE 2
+
 /* ESB supports channels 0..100 (2400..2500 MHz in 1 MHz steps). */
 #define CHANNEL_HOP_CHANNEL_COUNT 101
 #define CHANNEL_HOP_INVALID 0xFF
+
+/* Sentinel EWMA value meaning "no RSSI sample yet". RX RSSI is always a
+ * negative dBm reading, so a positive value never collides with a real one. */
+#define CHANNEL_RSSI_NONE INT8_MAX
+
+struct channel_rssi_state {
+#if defined(CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_RSSI_WEIGHT)
+    int8_t ewma[CHANNEL_HOP_CHANNEL_COUNT];
+#endif
+};
+
+#if defined(CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_RSSI_WEIGHT)
+void channel_rssi_reset(struct channel_rssi_state *r);
+void channel_rssi_update(struct channel_rssi_state *r, uint8_t channel, int8_t sample);
+bool channel_rssi_get(const struct channel_rssi_state *r, uint8_t channel, int8_t *out);
+#else
+static inline void channel_rssi_reset(struct channel_rssi_state *r) { (void)r; }
+static inline void channel_rssi_update(struct channel_rssi_state *r, uint8_t channel, int8_t sample) {
+    (void)r; (void)channel; (void)sample;
+}
+static inline bool channel_rssi_get(const struct channel_rssi_state *r, uint8_t channel, int8_t *out) {
+    (void)r; (void)channel; (void)out; return false;
+}
+#endif
 
 #if defined(CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_QUARANTINE_PERSIST)
 /* Persisted set of "worst offender" channels the picker avoids. The
@@ -64,7 +91,18 @@ uint8_t quarantine_count(const struct quarantine_state *q);
  * Returns CHANNEL_HOP_INVALID if no candidate exists even at distance=0
  * (e.g. every channel is quarantined and also matches avoid_channel —
  * should not happen in practice).
+ *
+ * channel_hop_pick selects uniformly among the surviving candidates.
+ * channel_hop_pick_weighted biases the draw by per-channel RSSI when `rssi`
+ * is non-NULL and RSSI weighting is enabled: candidates are weighted between
+ * CHANNEL_RSSI_WEIGHT_MIN and _MAX (best RSSI -> _MAX), unsampled channels at
+ * the midpoint. With rssi == NULL, or the feature disabled, it is uniform.
  */
 uint8_t channel_hop_pick(const struct quarantine_state *q,
                          uint8_t min_distance,
                          uint8_t avoid_channel);
+
+uint8_t channel_hop_pick_weighted(const struct quarantine_state *q,
+                                  uint8_t min_distance,
+                                  uint8_t avoid_channel,
+                                  const struct channel_rssi_state *rssi);
