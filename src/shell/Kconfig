@@ -32,6 +32,12 @@ config ZMK_ESB_ENDPOINT_SHELL_CMD_BUF_SIZE
     default 256
     depends on ZMK_ESB_ENDPOINT_SHELL_RELAY
 
+config ZMK_ESB_ENDPOINT_SHELL_DRAIN_RETRY_MS
+    int "Shell output drain retry interval (ms)"
+    default 5
+    range 1 100
+    depends on ZMK_ESB_ENDPOINT_SHELL_RELAY
+
 config ZMK_ESB_ENDPOINT_SHELL_STDOUT_COALESCE_BYTES
     int "stdout hook coalescing buffer size (bytes)"
     default 96

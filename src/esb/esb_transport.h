@@ -32,7 +32,7 @@ int  esb_transport_send(uint8_t pipe, const uint8_t *data, uint8_t len);
 uint8_t esb_transport_get_channel(void);
 
 /* The DTS-default channel the radio booted on. Used as a stable rendezvous
- * channel for re-syncing with a desynced dongle: the dongle's rollback
+ * channel for re-syncing with a desynced peer: the peer's rollback
  * dwell cycle always includes this channel, so a packet sent here will
  * eventually be heard even if the regular committed_next negotiation has
  * gone stale. */
@@ -102,6 +102,14 @@ int esb_transport_get_link_quality(uint8_t *retried_out, uint16_t *ewma_x10_out)
  * dx/dy) to skip emitting a report whose payload would be thrown away,
  * preserving the accumulated delta for the next emission. */
 bool esb_transport_is_quiet(void);
+
+/* True when the ESB TX FIFO is at least half full. The shell relay drain
+ * stops sending while this holds and leaves the bytes in the relay buffer,
+ * capping shell traffic at half the FIFO. This keeps esb_tx_full() out of
+ * reach for the non-shell send path, whose full-FIFO branch flushes the
+ * whole FIFO — which would silently discard queued shell packets that the
+ * relay has already released. */
+bool esb_transport_shell_backpressure(void);
 
 /* True when too many pointer-motion HID reports are in-flight (queued in
  * ESB's TX FIFO awaiting send/ack). Independent from is_quiet(): this is

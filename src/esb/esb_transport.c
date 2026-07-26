@@ -77,9 +77,9 @@ static struct {
     uint8_t prefixes[8];
     uint8_t channel;
     /* Channel the radio booted on (the DTS-default rendezvous channel).
-     * The dongle's rollback dwell cycle always includes this channel, so
+     * The peer's rollback dwell cycle always includes this channel, so
      * it is the one place the keyboard can reliably reach a desynced
-     * dongle. Set once in set_addresses(); never overwritten by hops. */
+     * peer. Set once in set_addresses(); never overwritten by hops. */
     uint8_t boot_channel;
     bool configured;
 } m_addr;
@@ -247,7 +247,7 @@ static uint8_t m_set_channel_busy_streak;
 
 /* Post-hop quiet window deadline. Set by esb_transport_set_channel();
  * esb_transport_send() silently drops packets while now < deadline so
- * the dongle has time to follow the speculative hop before we pile on
+ * the peer has time to follow the speculative hop before we pile on
  * new traffic that would otherwise count as failures. Zero means "no
  * active quiet period". 32-bit wrap-safe compare in the send path. */
 static uint32_t m_tx_quiet_until_ms;
@@ -355,7 +355,7 @@ static uint16_t jittered_retransmit_delay(void) {
     return (uint16_t)d;
 }
 
-/* Peer's (dongle's) view of the link. Stamped from ESB_PKT_LINK_STATS ACK
+/* Peer's view of the link. Stamped from ESB_PKT_LINK_STATS ACK
  * payloads; consumed by adaptive-retransmit and future TX-power logic.
  * m_peer_rssi_valid flips true on the first LINK_STATS RX — before that
  * the values are meaningless. Single-byte loads on Cortex-M, no lock. */
@@ -864,7 +864,7 @@ static void zmk_esb_transport_evt_cb(struct esb_evt const *event) {
          * path AND gives the hopper's cooldown a chance to expire between
          * attempts. A plain latch here would deadlock: if the hopper
          * early-returns while cooldown is active (by design, to let the
-         * dongle catch up on the new channel), a latch would stay set
+         * peer catch up on the new channel), a latch would stay set
          * forever because TX_SUCCESS never arrives on a dead link, so
          * no later streak could re-trigger. */
         if (consecutive_tx_fail == 1) {
@@ -935,6 +935,9 @@ static void zmk_esb_transport_evt_cb(struct esb_evt const *event) {
              * speculative hop against a coop hop. */
         }
 #endif
+#if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_SHELL_RELAY)
+        esb_shell_relay_notify_tx();
+#endif
 #if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_BENCH)
         esb_bench_notify_tx_fail();
 #endif
@@ -961,12 +964,6 @@ static int esb_init_and_configure(void) {
     cfg.retransmit_count   = CONFIG_ZMK_ESB_ENDPOINT_RETRANSMIT_COUNT;
     cfg.retransmit_delay   = CONFIG_ZMK_ESB_ENDPOINT_RETRANSMIT_DELAY_US;
     cfg.tx_mode            = ESB_TXMODE_AUTO;
-    /* nRF52833 fast ramp-up shortens radio RXIDLE→RX from ~140 µs to ~40 µs
-     * (RADIO->MODECNF0.RU=1). Both endpoint and dongle must match — see
-     * dongle/src/esb_prx.c cfg.use_fast_ramp_up. Shortens each retry's
-     * airtime budget, letting the retransmit_delay cover more back-to-back
-     * attempts and reducing the probability a retry window lands on a
-     * periodic interferer. */
     cfg.use_fast_ramp_up   = true;
     cfg.tx_output_power    = ESB_TX_POWER_8DBM;
     cfg.selective_auto_ack = IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_HID_NOACK);
@@ -1062,7 +1059,7 @@ int esb_transport_set_channel(const uint8_t channel) {
     z_nrf_clock_calibration_force_start();
 
     /* Drain any queued packets on the old channel — retransmits on the new
-     * channel would arrive at a dongle that has not yet hopped. The helper
+     * channel would arrive at a peer that has not yet hopped. The helper
      * also drains the noack/critical/motion rings, zeroes the inflight
      * pointer count, and restores the radio's retransmit_count, so any
      * critical- or pointer-override packet that got dropped by the flush
@@ -1093,7 +1090,7 @@ int esb_transport_set_channel(const uint8_t channel) {
     }
     m_addr.channel = channel;
     consecutive_tx_fail = 0;
-    /* Peer's RSSI view is per-link, not per-channel — the dongle samples
+    /* Peer's RSSI view is per-link, not per-channel — the peer samples
      * over its own radio which now has to re-establish contact. Invalidate
      * so consumers don't act on stale values during the quiet window. */
     m_peer_rssi_valid = false;
@@ -1113,7 +1110,7 @@ int esb_transport_set_channel(const uint8_t channel) {
     m_link_degraded_armed = false;
 #endif
     /* Cross-channel motion is stale by the time the new channel is live
-     * (post-quiet window + dongle catch-up), so additionally drop any
+     * (post-quiet window + peer catch-up), so additionally drop any
      * pending pointer refund — adding it to the next mouse report would
      * teleport the cursor. Matches the input processor's accumulator
      * clear at the same moment. The motion ring tail and inflight count
@@ -1125,7 +1122,7 @@ int esb_transport_set_channel(const uint8_t channel) {
     m_motion_refund.scroll_y = 0;
     m_motion_refund.stamp_ms = 0;
     /* Arm the post-hop quiet window. Any send() during this interval is
-     * silently dropped — the dongle may still be on the old channel and
+     * silently dropped — the peer may still be on the old channel and
      * anything we transmit would just fail and feed the next hop trigger.
      * Saturating add: the deadline stays in uint32 wrap-safe range for
      * every realistic quiet value. */
@@ -1182,6 +1179,10 @@ bool esb_transport_is_quiet(void) {
     }
 #endif
     return false;
+}
+
+bool esb_transport_shell_backpressure(void) {
+    return esb_tx_count() >= (CONFIG_ESB_TX_FIFO_SIZE / 2);
 }
 
 bool esb_transport_pointer_backpressure(void) {
@@ -1245,6 +1246,9 @@ int esb_transport_send(const uint8_t pipe, const uint8_t *data, uint8_t len) {
         return -EMSGSIZE;
     }
 
+    const bool is_shell = (len >= 1) &&
+        (data[0] == ESB_PKT_SHELL_DATA || data[0] == ESB_PKT_SHELL_POLL || data[0] == ESB_PKT_SHELL_STOP);
+
 #if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_RENDEZVOUS)
     /* Drop any user-thread send while a synchronous side-trip is on the
      * radio. The rendezvous send temporarily flips RADIO->FREQUENCY to
@@ -1252,7 +1256,7 @@ int esb_transport_send(const uint8_t pipe, const uint8_t *data, uint8_t len) {
      * state machine TX it on the wrong channel. The window is bounded
      * by RENDEZVOUS_TIMEOUT_MS (a few ms). */
     if (m_sync_tx_in_progress) {
-        return 0;
+        return is_shell ? -EAGAIN : 0;
     }
 #endif
 
@@ -1272,7 +1276,7 @@ int esb_transport_send(const uint8_t pipe, const uint8_t *data, uint8_t len) {
     (void)esb_set_retransmit_delay(jittered_retransmit_delay());
 
 #if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_HOP)
-    /* Post-hop quiet window: the dongle needs a moment to follow us to
+    /* Post-hop quiet window: the peer needs a moment to follow us to
      * the new channel. Silently drop user traffic until the deadline —
      * 32-bit wrap-safe compare. Losing CHANNEL_HOP_POST_QUIET_MS worth of
      * HID reports is strictly better than queueing them for a channel the
@@ -1282,7 +1286,7 @@ int esb_transport_send(const uint8_t pipe, const uint8_t *data, uint8_t len) {
         const uint32_t now = k_uptime_get_32();
         if ((int32_t)(m_tx_quiet_until_ms - now) > 0) {
             k_sched_unlock();
-            return 0;
+            return is_shell ? -EAGAIN : 0;
         }
         m_tx_quiet_until_ms = 0;
     }
@@ -1293,7 +1297,7 @@ int esb_transport_send(const uint8_t pipe, const uint8_t *data, uint8_t len) {
      * a dropped frame costs at most a few ticks of motion. Keyboard/consumer reports
      * carry edge-triggered state — a lost release packet strands the key on the host
      * forever (re-sending the same "released" state produces no HID edge). Keep them
-     * ACKed so ESB retransmits if the dongle misses one. */
+     * ACKed so ESB retransmits if the peer misses one. */
     const bool noack = (pipe == 1) && (len >= 2) &&
                        (data[0] == ESB_PKT_HID_REPORT) &&
                        (data[1] == ESB_REPORT_MOUSE);
@@ -1307,8 +1311,6 @@ int esb_transport_send(const uint8_t pipe, const uint8_t *data, uint8_t len) {
     };
     memcpy(pkt.data, data, len);
 
-    const bool is_shell = (len >= 1) &&
-        (data[0] == ESB_PKT_SHELL_DATA || data[0] == ESB_PKT_SHELL_POLL || data[0] == ESB_PKT_SHELL_STOP);
     /* Fail fast before any ring/refund bookkeeping when the FIFO is full
      * and this is a shell send. The non-shell path flushes (which resets
      * the rings), so esb_write_payload below always succeeds. The shell

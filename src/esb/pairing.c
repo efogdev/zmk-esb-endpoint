@@ -72,7 +72,7 @@ static void send_pair_resp(void) {
     esb_transport_send(ESB_PIPE_DATA, (uint8_t *)&pkt, sizeof(pkt));
 }
 
-static int settings_load_cb(const char *name, size_t len, const settings_read_cb read_cb, void *cb_arg) {
+static int settings_load_cb(const char *name, const size_t len, const settings_read_cb read_cb, void *cb_arg) {
     if (len != sizeof(struct esb_ep_paired_rec)) {
         LOG_WRN("unexpected settings record length %zu, dropping", len);
         return 0;

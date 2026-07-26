@@ -473,6 +473,12 @@ int esb_pop_tx(void);
  */
 bool esb_tx_full(void);
 
+/** @brief Get the number of payloads currently queued in the TX FIFO.
+ *
+ * @return Number of queued payloads.
+ */
+uint32_t esb_tx_count(void);
+
 /** @brief Flush the RX buffer.
  *
  * @retval 0 If successful.

@@ -2318,6 +2318,11 @@ bool esb_tx_full(void)
 	return tx_fifo.count >= CONFIG_ESB_TX_FIFO_SIZE;
 }
 
+uint32_t esb_tx_count(void)
+{
+	return tx_fifo.count;
+}
+
 int esb_flush_rx(void)
 {
 	if (!esb_initialized) {
