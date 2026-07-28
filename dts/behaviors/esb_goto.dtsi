@@ -1,0 +1,14 @@
+/*
+ * Copyright (c) 2025 efogdev
+ * SPDX-License-Identifier: MIT
+ */
+
+/ {
+    behaviors {
+        goto_esb: goto_esb {
+            compatible = "zmk,behavior-esb-goto";
+            #binding-cells = <0>;
+            display-name = "Switch to dongle";
+        };
+    };
+};

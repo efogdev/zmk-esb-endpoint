@@ -165,6 +165,7 @@ static void esb_ctrl_thread_fn(void *p1, void *p2, void *p3) {
     int cmd;
     while (1) {
         k_msgq_get(&esb_ctrl_msgq, &cmd, K_FOREVER);
+        LOG_INF("got command: %d", cmd);
         if (cmd == ESB_CMD_ACTIVATE) {
             /* Quiesce the BLE LL instead of tearing down the whole stack:
              *   - disconnect active peers (LL stops conn events)
@@ -176,8 +177,9 @@ static void esb_ctrl_thread_fn(void *p1, void *p2, void *p3) {
             bt_le_adv_stop();
             k_sleep(K_MSEC(CONFIG_ZMK_ESB_ENDPOINT_BLE_QUIESCE_MS));
             configure_esb_addresses();
-            pairing_start();
             esb_transport_on_slot_start();
+            k_sleep(K_MSEC(1));
+            pairing_start();
             esb_active = true;
 #if IS_ENABLED(CONFIG_ZMK_ADAPTIVE_FEEDBACK)
             zaf_custom_event_trigger(&esb_switched_to_dongle);

@@ -604,8 +604,7 @@ static void motion_refund_apply(struct esb_mouse_body *body) {
  * matching event handler can restore. Non-mouse sends push a zero record
  * to keep head/tail in lockstep with TX events. */
 static void motion_ring_push(const struct esb_mouse_body *body, const bool overrode) {
-    const uint32_t slot = m_recent_motion_head %
-        CONFIG_ZMK_ESB_ENDPOINT_POINTER_MOTION_RING_SIZE;
+    const uint32_t slot = m_recent_motion_head % CONFIG_ZMK_ESB_ENDPOINT_POINTER_MOTION_RING_SIZE;
     if (body) {
         m_recent_motion[slot].dx       = body->d_x;
         m_recent_motion[slot].dy       = body->d_y;
@@ -819,7 +818,6 @@ static void zmk_esb_transport_evt_cb(struct esb_evt const *event) {
 #endif
         motion_ring_consume(false);
         break;
-
 
     case ESB_EVENT_RX_RECEIVED:
         while (esb_read_rx_payload(&m_rx_payload) == 0) {
@@ -1625,12 +1623,10 @@ void esb_transport_on_slot_start(void) {
      * programmed) so the worker's cached value matches reality before
      * the first EWMA sample arrives. */
     m_adaptive_retransmit_count = CONFIG_ZMK_ESB_ENDPOINT_RETRANSMIT_COUNT;
-    k_work_reschedule(&m_adaptive_retry_work,
-                      K_MSEC(CONFIG_ZMK_ESB_ENDPOINT_ADAPTIVE_RETRY_INTERVAL_MS));
+    k_work_reschedule(&m_adaptive_retry_work, K_MSEC(CONFIG_ZMK_ESB_ENDPOINT_ADAPTIVE_RETRY_INTERVAL_MS));
 #endif
     k_sched_unlock();
-    LOG_DBG("ESB slot start OK (VTOR[RADIO]=0x%08x)",
-            m_ram_vtor[16 + RADIO_IRQn]);
+    LOG_DBG("ESB slot start OK (VTOR[RADIO]=0x%08x)", m_ram_vtor[16 + RADIO_IRQn]);
 }
 
 void esb_transport_on_slot_stop(void) {
