@@ -120,7 +120,7 @@ void pairing_start(void) {
         m_state = PAIRING_STATE_VERIFYING;
         k_work_reschedule(&verify_work, K_NO_WAIT);
     } else {
-        LOG_INF("no dongle, advertising BEACON");
+        LOG_DBG("no dongle, advertising BEACON");
         m_state = PAIRING_STATE_UNPAIRED;
         k_work_reschedule(&beacon_work, K_MSEC(CONFIG_ZMK_ESB_ENDPOINT_BEACON_INITIAL_DELAY_MS));
     }
@@ -187,7 +187,7 @@ void pairing_on_rx(const uint8_t *data, const uint8_t len) {
             if (memcmp(resp->device_id, m_peer_device_id, sizeof(m_peer_device_id)) == 0) {
                 k_work_cancel_delayable(&verify_work);
                 m_state = PAIRING_STATE_CONNECTED;
-                LOG_INF("dongle connected");
+                LOG_DBG("dongle connected");
 #if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_SHELL_RELAY)
                 esb_shell_relay_on_connected();
 #endif
@@ -205,7 +205,7 @@ void pairing_on_rx(const uint8_t *data, const uint8_t len) {
         break;
 
     case ESB_PKT_DISCONNECT:
-        LOG_INF("dongle disconnected");
+        LOG_DBG("dongle disconnected");
         m_state = PAIRING_STATE_UNPAIRED;
         m_has_stored_peer = false;
         memset(m_peer_device_id, 0, sizeof(m_peer_device_id));
@@ -226,7 +226,7 @@ void pairing_on_rx(const uint8_t *data, const uint8_t len) {
          * VERIFY_REQ, which the dongle (still in STATE_VERIFYING) answers
          * with VERIFY_RESP, returning us to CONNECTED without a re-pair. */
         if (m_state == PAIRING_STATE_CONNECTED) {
-            LOG_INF("dongle requested RESYNC, re-verifying");
+            LOG_DBG("dongle requested RESYNC, re-verifying");
             m_state = PAIRING_STATE_VERIFYING;
             k_work_reschedule(&verify_work, K_NO_WAIT);
 #if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_SHELL_RELAY)

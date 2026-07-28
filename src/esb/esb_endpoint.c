@@ -165,7 +165,6 @@ static void esb_ctrl_thread_fn(void *p1, void *p2, void *p3) {
     int cmd;
     while (1) {
         k_msgq_get(&esb_ctrl_msgq, &cmd, K_FOREVER);
-        LOG_INF("got command: %d", cmd);
         if (cmd == ESB_CMD_ACTIVATE) {
             /* Quiesce the BLE LL instead of tearing down the whole stack:
              *   - disconnect active peers (LL stops conn events)
