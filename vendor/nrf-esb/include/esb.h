@@ -460,6 +460,35 @@ int esb_stop_tx(void);
  */
 int esb_flush_tx(void);
 
+/** @brief Stash the TX FIFO contents aside and clear the FIFO.
+ *
+ *  Snapshots every queued payload (in queue order, PIDs included) into an
+ *  internal buffer and empties the TX FIFO, so the radio can be retuned or
+ *  borrowed without dropping queued traffic. A later esb_restore_tx()
+ *  re-queues the snapshot. Calling esb_stash_tx() again overwrites any
+ *  previous stash. PTX mode only. Like esb_flush_tx(), this must not race
+ *  an in-flight TX transaction — quiesce the radio first.
+ *
+ * @retval Number of payloads stashed (>= 0) if successful.
+ *         Otherwise, a (negative) error code is returned.
+ */
+int esb_stash_tx(void);
+
+/** @brief Re-queue the payloads saved by esb_stash_tx().
+ *
+ *  Appends the stashed payloads to the TX FIFO in their original order,
+ *  preserving their already-assigned PIDs. Does not start a TX transaction;
+ *  call esb_start_tx() (or let the next esb_write_payload() kick the radio)
+ *  when transmission should resume. With no stash held this is a no-op.
+ *
+ * @retval Number of payloads restored (>= 0) if successful. The stash is
+ *         consumed.
+ * @retval -ENOMEM if the FIFO lacks room for the whole stash; nothing is
+ *         restored and the stash is kept.
+ *         Otherwise, a (negative) error code is returned.
+ */
+int esb_restore_tx(void);
+
 /** @brief Pop the first item from the TX buffer.
  *
  * @retval 0 If successful.

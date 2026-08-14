@@ -46,8 +46,8 @@ struct esb_ip_data {
     struct k_work_delayable retry_work;
 };
 
-static void send_hid_report_raw(const uint8_t buttons, const int32_t dx, const int32_t dy,
-                                const int32_t scroll_x, const int32_t scroll_y) {
+static int send_hid_report_raw(const uint8_t buttons, const int32_t dx, const int32_t dy,
+                               const int32_t scroll_x, const int32_t scroll_y) {
     const struct zmk_hid_mouse_report_body body = {
         .buttons    = buttons,
         .d_x        = (int16_t)CLAMP(dx,       INT16_MIN, INT16_MAX),
@@ -60,31 +60,63 @@ static void send_hid_report_raw(const uint8_t buttons, const int32_t dx, const i
         .report_type = ESB_REPORT_MOUSE,
     };
     memcpy(pkt.data, &body, sizeof(body));
-    esb_transport_send(ESB_PIPE_DATA, (uint8_t *)&pkt, sizeof(pkt));
+    return esb_transport_send(ESB_PIPE_DATA, (uint8_t *)&pkt, sizeof(pkt));
 }
 
-static void enqueue_pending_button(struct esb_ip_data *d) {
+/* Caller must hold the scheduler lock: the queue is touched from the
+ * input thread (event handler) and the system workqueue (retry worker,
+ * transport resync callback), and k_sched_lock() is the module-wide
+ * mutual exclusion between those two contexts (single core, no ISR
+ * involvement — mirrors hid_relay.c's locking note). */
+static void enqueue_pending_button_locked(struct esb_ip_data *d) {
     if (d->pending_count >= ESB_IP_PENDING_BTN_QUEUE) {
         /* Drop the oldest so the queue still ends on the latest state.
          * An overrun means more edges happened in the quiet window than
          * we budgeted for; preserving the final state matters more than
          * any one intermediate edge. */
-        memmove(&d->pending_buttons[0], &d->pending_buttons[1],
-                ESB_IP_PENDING_BTN_QUEUE - 1u);
+        memmove(&d->pending_buttons[0], &d->pending_buttons[1], ESB_IP_PENDING_BTN_QUEUE - 1u);
         d->pending_count = ESB_IP_PENDING_BTN_QUEUE - 1u;
     }
     d->pending_buttons[d->pending_count++] = d->buttons;
 }
 
 /* Replays queued button-edge snapshots in order as buttons-only HID
- * reports. Caller must verify the transport is no longer quiet, and is
- * responsible for the trailing "current state" report (with motion)
- * once the queue has drained. */
-static void drain_pending_buttons(struct esb_ip_data *d) {
-    for (uint8_t i = 0; i < d->pending_count; i++) {
-        send_hid_report_raw(d->pending_buttons[i], 0, 0, 0, 0);
-    }
+ * reports. Snapshot-and-clear under the scheduler lock, send from the
+ * local copy — a concurrent enqueue lands in the live queue instead of
+ * being wiped, and the lock is never held across a send. Returns 0 when
+ * fully drained; -EAGAIN when the transport went quiet mid-drain, with
+ * the unsent tail re-parked at the queue head (ahead of anything
+ * enqueued meanwhile — the tail is strictly older; on overflow the
+ * oldest tail entries drop so the queue still ends on latest state).
+ * The caller owns the trailing "current state" report (with motion)
+ * once the queue has drained, and reschedules the retry worker on
+ * -EAGAIN. */
+static int drain_pending_buttons(struct esb_ip_data *d) {
+    uint8_t snap[ESB_IP_PENDING_BTN_QUEUE];
+    k_sched_lock();
+    const uint8_t n = d->pending_count;
+    memcpy(snap, d->pending_buttons, n);
     d->pending_count = 0;
+    k_sched_unlock();
+    for (uint8_t i = 0; i < n; i++) {
+        if (send_hid_report_raw(snap[i], 0, 0, 0, 0) != -EAGAIN) {
+            continue;
+        }
+        k_sched_lock();
+        uint8_t tail = n - i;
+        const uint8_t live = d->pending_count;
+        if (tail + live > ESB_IP_PENDING_BTN_QUEUE) {
+            const uint8_t drop = (uint8_t)(tail + live - ESB_IP_PENDING_BTN_QUEUE);
+            i += drop;
+            tail = (drop >= tail) ? 0u : (uint8_t)(tail - drop);
+        }
+        memmove(&d->pending_buttons[tail], &d->pending_buttons[0], live);
+        memcpy(&d->pending_buttons[0], &snap[i], tail);
+        d->pending_count = (uint8_t)(tail + live);
+        k_sched_unlock();
+        return -EAGAIN;
+    }
+    return 0;
 }
 
 static void retry_work_fn(struct k_work *work) {
@@ -95,7 +127,10 @@ static void retry_work_fn(struct k_work *work) {
         k_work_reschedule(&d->retry_work, K_MSEC(ESB_IP_QUIET_RETRY_MS));
         return;
     }
-    drain_pending_buttons(d);
+    if (drain_pending_buttons(d) == -EAGAIN) {
+        k_work_reschedule(&d->retry_work, K_MSEC(ESB_IP_QUIET_RETRY_MS));
+        return;
+    }
 
     /* Flush any motion that accumulated during the deferral window as a
      * final report before clearing the accumulator. Two cases:
@@ -105,16 +140,33 @@ static void retry_work_fn(struct k_work *work) {
      *    is stale by the time the host would see it.
      * The MOTION_MAX_STALE_MS check distinguishes them — fresh motion
      * flushes; older motion is dropped to avoid teleporting the cursor.
-     * Buttons drained above already inform the host of any edge. */
-    if (d->accum_start_ms != 0) {
-        const uint32_t age = k_uptime_get_32() - d->accum_start_ms;
-        if (age <= ESB_IP_MOTION_MAX_STALE_MS &&
-            (d->dx | d->dy | d->scroll_x | d->scroll_y)) {
-            send_hid_report_raw(d->buttons, d->dx, d->dy,
-                                d->scroll_x, d->scroll_y);
+     * Buttons drained above already inform the host of any edge.
+     * Snapshot-and-clear under the lock so a delta arriving mid-flush
+     * is not lost to the clear; on -EAGAIN the deltas (and the original
+     * staleness anchor) are merged back for the next attempt. */
+    k_sched_lock();
+    const uint32_t start = d->accum_start_ms;
+    const uint8_t  btns  = d->buttons;
+    const int32_t  dx = d->dx, dy = d->dy, sx = d->scroll_x, sy = d->scroll_y;
+    d->dx = d->dy = d->scroll_x = d->scroll_y = 0;
+    d->accum_start_ms = 0;
+    k_sched_unlock();
+    if (start != 0) {
+        const uint32_t age = k_uptime_get_32() - start;
+        if (age <= ESB_IP_MOTION_MAX_STALE_MS && (dx | dy | sx | sy)) {
+            if (send_hid_report_raw(btns, dx, dy, sx, sy) == -EAGAIN) {
+                k_sched_lock();
+                d->dx += dx;
+                d->dy += dy;
+                d->scroll_x += sx;
+                d->scroll_y += sy;
+                if (d->accum_start_ms == 0) {
+                    d->accum_start_ms = start;
+                }
+                k_sched_unlock();
+                k_work_reschedule(&d->retry_work, K_MSEC(ESB_IP_QUIET_RETRY_MS));
+            }
         }
-        d->dx = d->dy = d->scroll_x = d->scroll_y = 0;
-        d->accum_start_ms = 0;
     }
 }
 
@@ -131,7 +183,9 @@ static void send_mouse_report(struct esb_ip_data *d, const bool button_changed) 
      * worker drains the queue once the deferral condition clears. */
     if (esb_transport_is_quiet() || esb_transport_pointer_backpressure()) {
         if (button_changed) {
-            enqueue_pending_button(d);
+            k_sched_lock();
+            enqueue_pending_button_locked(d);
+            k_sched_unlock();
             k_work_reschedule(&d->retry_work, K_MSEC(ESB_IP_QUIET_RETRY_MS));
         }
         return;
@@ -141,8 +195,19 @@ static void send_mouse_report(struct esb_ip_data *d, const bool button_changed) 
      * buttons-only report so the host sees every press/release in
      * order, then fall through to send the current state (which may
      * differ from the last queue entry if a button edge happened after
-     * quiet ended but before this call). No-op when the queue is empty. */
-    drain_pending_buttons(d);
+     * quiet ended but before this call). No-op when the queue is empty.
+     * -EAGAIN means the transport went quiet again between the advisory
+     * check above and the drain — park this edge too and let the retry
+     * worker replay; motion stays in the accumulator untouched. */
+    if (drain_pending_buttons(d) == -EAGAIN) {
+        if (button_changed) {
+            k_sched_lock();
+            enqueue_pending_button_locked(d);
+            k_sched_unlock();
+        }
+        k_work_reschedule(&d->retry_work, K_MSEC(ESB_IP_QUIET_RETRY_MS));
+        return;
+    }
 
     /* Drop motion that accumulated longer ago than MOTION_MAX_STALE_MS.
      * Happens when a long stall (post-hop quiet, sync-TX, radio issue)
@@ -161,9 +226,58 @@ static void send_mouse_report(struct esb_ip_data *d, const bool button_changed) 
         }
     }
 
-    send_hid_report_raw(d->buttons, d->dx, d->dy, d->scroll_x, d->scroll_y);
+    /* Snapshot-and-clear under the lock (a delta arriving mid-send must
+     * not be lost to the clear), send from the copy. On -EAGAIN — the
+     * quiet window armed after the advisory check — merge the deltas
+     * back (with the original staleness anchor), park the button edge
+     * if there was one, and let the retry worker finish. */
+    k_sched_lock();
+    const uint32_t start = d->accum_start_ms;
+    const uint8_t  btns  = d->buttons;
+    const int32_t  dx = d->dx, dy = d->dy, sx = d->scroll_x, sy = d->scroll_y;
     d->dx = d->dy = d->scroll_x = d->scroll_y = 0;
     d->accum_start_ms = 0;
+    k_sched_unlock();
+    if (send_hid_report_raw(btns, dx, dy, sx, sy) == -EAGAIN) {
+        k_sched_lock();
+        d->dx += dx;
+        d->dy += dy;
+        d->scroll_x += sx;
+        d->scroll_y += sy;
+        if (d->accum_start_ms == 0 && start != 0) {
+            d->accum_start_ms = start;
+        }
+        if (button_changed) {
+            enqueue_pending_button_locked(d);
+        }
+        k_sched_unlock();
+        k_work_reschedule(&d->retry_work, K_MSEC(ESB_IP_QUIET_RETRY_MS));
+    }
+}
+
+/* Transport delivery-failure resync: an ACKed mouse report died
+ * undelivered (retry exhaustion or FIFO flush), so the host may hold a
+ * stale buttons view — a lost press while still held, or a lost release
+ * leaving a phantom drag. Motion recovery is owned by the transport's
+ * refund pool; this re-sends only the current absolute buttons state,
+ * which is idempotent. Deferral conditions park the state in the
+ * pending queue for the retry worker, same as a live edge would. */
+static void esb_ip_resync_cb(const uint8_t kinds, void *ctx) {
+    struct esb_ip_data *d = ctx;
+    if (!(kinds & ESB_HID_RESYNC_MOUSE)) {
+        return;
+    }
+    if (!zmk_esb_endpoint_is_active() || !pairing_is_connected()) {
+        return;
+    }
+    if (esb_transport_is_quiet() || esb_transport_pointer_backpressure() ||
+        drain_pending_buttons(d) == -EAGAIN ||
+        send_hid_report_raw(d->buttons, 0, 0, 0, 0) == -EAGAIN) {
+        k_sched_lock();
+        enqueue_pending_button_locked(d);
+        k_sched_unlock();
+        k_work_reschedule(&d->retry_work, K_MSEC(ESB_IP_QUIET_RETRY_MS));
+    }
 }
 
 static int esb_ip_handle_event(const struct device *dev, struct input_event *event, uint32_t param1, uint32_t param2,
@@ -231,6 +345,7 @@ static int esb_ip_init(const struct device *dev) {
     struct esb_ip_data *d = dev->data;
     memset(d, 0, sizeof(*d));
     k_work_init_delayable(&d->retry_work, retry_work_fn);
+    (void)esb_transport_register_hid_resync_cb(esb_ip_resync_cb, d);
     return 0;
 }
 

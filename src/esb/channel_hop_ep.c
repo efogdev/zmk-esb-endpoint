@@ -12,13 +12,6 @@
 #if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_QUARANTINE_PERSIST) || IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_RSSI_WEIGHT)
 #include <zephyr/settings/settings.h>
 #endif
-#if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_QUARANTINE_PERSIST)
-#if IS_ENABLED(CONFIG_ZMK_RUNTIME_CONFIG)
-#include <zmk_runtime_config/runtime_config.h>
-#else
-#define ZRC_GET(key, default_val) (default_val)
-#endif
-#endif
 
 #include <zephyr/logging/log.h>
 
@@ -245,18 +238,6 @@ static void coop_hop_abort(void);
 #endif
 
 #if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_QUARANTINE_PERSIST)
-#define PERSIST_SETTINGS_KEY "esb_hop/quar"
-#define PERSIST_ZRC_KEY      "esb/quar_n"
-
-#define PERSIST_N_MAX     CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_QUARANTINE_PERSIST_SIZE
-/* Track three times as many candidates as we ultimately keep, so a channel
- * has to out-offend a working set before it makes the persisted top N. */
-#define HIT_TABLE_SIZE    (PERSIST_N_MAX * 3)
-/* Offender list as serialised: one length byte + (channel, u16 hits) each. */
-#define PERSIST_OFF_MAX   (1 + PERSIST_N_MAX * 3)
-/* Full NVS record: u16 decay accumulator (minutes) + the offender list. */
-#define PERSIST_REC_MAX   (2 + PERSIST_OFF_MAX)
-
 /* In-memory evidence: how many times each channel has been condemned by a
  * fail-driven hop. Distilled to the persisted avoided set every
  * PERSIST_INTERVAL_MS; aged by persist_decay_check(). */
@@ -596,9 +577,6 @@ static void persist_load(void) {
     m_decay_frac_ms = 0;
     m_decay_last_uptime = k_uptime_get_32();
     m_saved_accum_min = 0;
-#if IS_ENABLED(CONFIG_ZMK_RUNTIME_CONFIG)
-    zrc_register(PERSIST_ZRC_KEY, PERSIST_N_MAX, 0, PERSIST_N_MAX);
-#endif
 #endif
     settings_subsys_init();
     settings_load_subtree("esb_hop");

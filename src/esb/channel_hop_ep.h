@@ -13,6 +13,26 @@
 #include <stdint.h>
 #include <stdbool.h>
 
+#if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_QUARANTINE_PERSIST)
+#if IS_ENABLED(CONFIG_ZMK_RUNTIME_CONFIG)
+#include <zmk_runtime_config/runtime_config.h>
+#else
+#define ZRC_GET(key, default_val) (default_val)
+#endif
+
+#define PERSIST_SETTINGS_KEY "esb_hop/quar"
+#define PERSIST_ZRC_KEY      "esb/quar_n"
+
+#define PERSIST_N_MAX     CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_QUARANTINE_PERSIST_SIZE
+/* Track three times as many candidates as we ultimately keep, so a channel
+ * has to out-offend a working set before it makes the persisted top N. */
+#define HIT_TABLE_SIZE    (PERSIST_N_MAX * 3)
+/* Offender list as serialised: one length byte + (channel, u16 hits) each. */
+#define PERSIST_OFF_MAX   (1 + PERSIST_N_MAX * 3)
+/* Full NVS record: u16 decay accumulator (minutes) + the offender list. */
+#define PERSIST_REC_MAX   (2 + PERSIST_OFF_MAX)
+#endif
+
 void channel_hop_ep_init(void);
 
 /* Called from esb_endpoint when pairing transitions into CONNECTED state

@@ -23,9 +23,53 @@ typedef struct {
 
 typedef void (*esb_transport_cb_t)(const esb_transport_evt_t *evt);
 
+/* HID payload classification carried through the per-send ring so a
+ * delivery failure (retry exhaustion or FIFO flush) can be reported back
+ * to the layer that owns the report state. Values are bit positions in
+ * the resync mask handed to registered callbacks. */
+enum esb_transport_hid_kind {
+    ESB_HID_KIND_NONE = 0,
+    ESB_HID_KIND_KB,
+    ESB_HID_KIND_CONS,
+    ESB_HID_KIND_MOUSE,
+};
+#define ESB_HID_RESYNC_KB    BIT(ESB_HID_KIND_KB)
+#define ESB_HID_RESYNC_CONS  BIT(ESB_HID_KIND_CONS)
+#define ESB_HID_RESYNC_MOUSE BIT(ESB_HID_KIND_MOUSE)
+
+/* Invoked from the system workqueue (never ISR) after one or more HID
+ * reports failed delivery — retransmit budget exhausted or dropped by a
+ * TX-FIFO flush. `kinds_mask` is an OR of ESB_HID_RESYNC_* bits naming
+ * the report types that were lost. Keyboard/consumer/mouse-button state
+ * is absolute per report, so the expected reaction is "re-send current
+ * state", which is idempotent no matter how many failures coalesced
+ * into the call. The callback runs HID_RESYNC_DELAY_MS after the first
+ * failure so a burst collapses into one resync and a post-hop quiet
+ * window has time to arm (the resync send then parks in the caller's
+ * pending queue instead of feeding the failure counters). */
+typedef void (*esb_transport_hid_resync_cb_t)(uint8_t kinds_mask, void *ctx);
+
+/* Register a resync consumer. Fixed slot table; returns -ENOMEM when
+ * full, 0 otherwise. There is no unregister — consumers are singletons
+ * (hid_relay) or static per-device instances (input processor) that
+ * live for the firmware lifetime. Callbacks must tolerate being called
+ * while their transport-facing state is idle/disconnected. */
+int esb_transport_register_hid_resync_cb(esb_transport_hid_resync_cb_t cb, void *ctx);
+
 int  esb_transport_init(esb_transport_cb_t cb);
 void esb_transport_deinit(void);
 void esb_transport_set_addresses(const uint8_t base0[4], const uint8_t base1[4], const uint8_t prefixes[8], uint8_t channel);
+
+/* Queue one packet for TX on the active channel. Returns 0 when the
+ * payload was accepted by the ESB TX FIFO (acceptance, not delivery —
+ * delivery failures surface via the HID resync callback for HID
+ * reports), -EAGAIN when the transport is in a state that cannot take
+ * user traffic right now (post-hop quiet window, synchronous rendezvous
+ * side-trip in flight) — the packet was NOT queued and the caller must
+ * retry or re-enqueue it, -EMSGSIZE / -ENOMEM / esb errors otherwise.
+ * The esb_transport_is_quiet() pre-check is advisory only; this return
+ * code is the authoritative answer (the quiet flag can be armed by the
+ * hop worker between a caller's check and the send). */
 int  esb_transport_send(uint8_t pipe, const uint8_t *data, uint8_t len);
 
 /* Current RF channel (last value applied via set_addresses or set_channel). */

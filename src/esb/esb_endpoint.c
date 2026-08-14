@@ -391,7 +391,7 @@ static int cmd_esb_status(const struct shell *sh, const size_t argc, char **argv
     {
         shell_print(sh, "");
 
-        struct channel_hop_ep_offender off[16];
+        struct channel_hop_ep_offender off[(uint8_t)ZRC_GET(PERSIST_ZRC_KEY, PERSIST_N_MAX)];
         const uint8_t n = channel_hop_ep_get_offenders(off, ARRAY_SIZE(off));
         char line[ARRAY_SIZE(off) * 12 + 1];
         size_t pos;
@@ -425,10 +425,10 @@ static int cmd_esb_status(const struct shell *sh, const size_t argc, char **argv
 
 #if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_RSSI_WEIGHT)
     {
-        struct channel_hop_ep_rssi rssi[32];
+        struct channel_hop_ep_rssi rssi[CHANNEL_HOP_CHANNEL_COUNT];
         const uint8_t rn = channel_hop_ep_get_rssi(rssi, ARRAY_SIZE(rssi));
         if (rn == 0) {
-            shell_print(sh, "(in)famous channels:   <none>");
+            shell_print(sh, "known channels:   <none>");
         } else {
             char line[8 * 12 + 1];
             for (uint8_t i = 0; i < rn; ) {
@@ -439,7 +439,7 @@ static int cmd_esb_status(const struct shell *sh, const size_t argc, char **argv
                         (unsigned)rssi[j].channel, (int)rssi[j].ewma);
                 }
                 if (i == 0) {
-                    shell_print(sh, "(in)famous channels:   %s", line);
+                    shell_print(sh, "known channels:   %s", line);
                 } else {
                     shell_print(sh, "                       %s", line);
                 }

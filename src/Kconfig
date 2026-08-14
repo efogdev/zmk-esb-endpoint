@@ -452,7 +452,7 @@ config ZMK_ESB_ENDPOINT_HID_QUIET_RETRY_MS
 
 config ZMK_ESB_ENDPOINT_IP_PENDING_BTN_QUEUE
     int "Input-processor pending button-edge queue depth"
-    default 8
+    default 20
     range 1 32
     help
       Per-instance ring depth for mouse-button edges that fall during a
@@ -473,6 +473,22 @@ config ZMK_ESB_ENDPOINT_IP_QUIET_RETRY_MS
       while either signal is set. Drives motion + queued button-edge
       replay latency once the deferral condition clears. Mirror of
       HID_QUIET_RETRY_MS for the input processor side.
+
+config ZMK_ESB_ENDPOINT_HID_RESYNC_DELAY_MS
+    int "Delay before re-sending HID state after a delivery failure (ms)"
+    default 12
+    range 1 500
+    help
+      When an ACKed HID report (keyboard, consumer, or mouse) exhausts
+      its retransmit budget or is dropped by a TX-FIFO flush, the
+      transport schedules a state resync: the HID layers re-send their
+      current absolute report state so a lost press/release edge cannot
+      strand a key or button on the host. This delay coalesces a burst
+      of failures into one resync and gives a channel hop's quiet
+      window time to arm first, so the resync itself is not fed
+      straight back into the failure counters. Keyboard/button state is
+      absolute per report, so the resync is idempotent regardless of
+      how many failures collapsed into it.
 
 config ZMK_ESB_ENDPOINT_CHANNEL_HOP
     bool "Dynamic channel hopping on TX failure"
@@ -552,17 +568,14 @@ config ZMK_ESB_ENDPOINT_CHANNEL_HOP_POST_QUIET_MS
 
 config ZMK_ESB_ENDPOINT_MOTION_MAX_STALE_MS
     int "Drop accumulated pointer motion older than this (ms)"
-    default 200
+    default 1000
     range 1 5000
     help
       Maximum age of accumulated pointer deltas in the ESB input
       processor before they are dropped instead of flushed. Dropping
       stale motion prevents a post-quiet catch-up flush from teleporting
       the cursor by tens of accumulated deltas after a long stall
-      (post-hop quiet, sync-TX side-trip, radio issue). Should sit
-      between one HID frame (~1 ms at 1 kHz) and CHANNEL_HOP_POST_QUIET_MS
-      plus a few radio retries. Button edges always flush regardless of
-      staleness.
+      (post-hop quiet, sync-TX side-trip, radio issue).
 
 config ZMK_ESB_ENDPOINT_CHANNEL_QUARANTINE_MS
     int "Quarantine hold time for a bad channel (ms)"
@@ -909,7 +922,7 @@ endif # ZMK_ESB_ENDPOINT_CHANNEL_HOP
 
 config ZMK_ESB_ENDPOINT_FLUSH_QUIET_MS
     int "Pre-flush radio quiet wait (ms)"
-    default 2
+    default 0
     range 0 100
     help
       Before esb_transport_flush_tx() drops queued packets, it waits
@@ -924,7 +937,7 @@ config ZMK_ESB_ENDPOINT_FLUSH_QUIET_MS
 
 config ZMK_ESB_ENDPOINT_FLUSH_FORCE_MS
     int "Pre-flush wait ceiling before forced flush (ms)"
-    default 3
+    default 1
     range 1 500
     help
       Upper bound on how long esb_transport_flush_tx() will wait for

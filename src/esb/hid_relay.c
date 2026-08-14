@@ -40,16 +40,26 @@ static zmk_mod_flags_t explicit_mods;
 static zmk_mod_flags_t implicit_mods;
 
 /* Per-report snapshot rings used to defer reports past a transport-quiet
- * window (post-hop quiet, sync-TX side-trip). esb_transport_send() drops
- * silently during those windows; without these rings, intermediate
- * press/release edges that fall in the window are lost — kb_body /
- * cons_body keep evolving, so by the time the window ends only the
- * latest state remains and the host never observes the missed edges
+ * window (post-hop quiet, sync-TX side-trip). esb_transport_send()
+ * returns -EAGAIN during those windows; without these rings,
+ * intermediate press/release edges that fall in the window are lost —
+ * kb_body / cons_body keep evolving, so by the time the window ends only
+ * the latest state remains and the host never observes the missed edges
  * (stranded modifiers, missing keystrokes). On overrun the oldest entry
  * is shifted out so the queue still ends on the latest state; final
  * steady-state stays correct, only the truncated head of a long burst
  * is lost. Same trade-off the mouse path documents in
- * input_processor_esb.c:71-82. */
+ * input_processor_esb.c:71-82.
+ *
+ * Locking: the rings and the report/modifier state are touched from two
+ * contexts — the ZMK event thread (hid_relay_cb) and the system
+ * workqueue (hid_retry_work, the transport's HID resync callback). All
+ * mutations happen under k_sched_lock(), which on this single-core part
+ * is sufficient mutual exclusion between threads (no ISR touches this
+ * state). The lock is never held across esb_transport_send(): drains
+ * snapshot-and-clear the ring under the lock, then send from the local
+ * copy, re-parking any unsent tail if the transport goes quiet
+ * mid-drain. */
 static struct zmk_hid_keyboard_report_body
     kb_pending[CONFIG_ZMK_ESB_ENDPOINT_HID_QUIET_KB_QUEUE_DEPTH];
 static uint8_t kb_pending_count;
@@ -148,52 +158,109 @@ static int send_hid_pkt(uint8_t report_type, const void *body, size_t body_len) 
     return esb_transport_send(ESB_PIPE_DATA, (uint8_t *)&pkt, sizeof(pkt));
 }
 
-static void send_kb_body(const struct zmk_hid_keyboard_report_body *body) {
+static int send_kb_body(const struct zmk_hid_keyboard_report_body *body) {
     const int err = send_hid_pkt(ESB_REPORT_KEYBOARD, body, sizeof(*body));
-    if (err && err != -ENOMEM) {
+    if (err && err != -ENOMEM && err != -EAGAIN) {
         LOG_WRN("KB report send err %d", err);
     }
+    return err;
 }
 
-static void send_cons_body(const struct zmk_hid_consumer_report_body *body) {
+static int send_cons_body(const struct zmk_hid_consumer_report_body *body) {
     const int err = send_hid_pkt(ESB_REPORT_CONSUMER, body, sizeof(*body));
-    if (err && err != -ENOMEM) {
+    if (err && err != -ENOMEM && err != -EAGAIN) {
         LOG_WRN("consumer report send err %d", err);
     }
+    return err;
 }
 
-static void enqueue_pending_kb(void) {
+/* Queue-append helpers. Caller must hold the scheduler lock. */
+static void enqueue_pending_kb_locked(const struct zmk_hid_keyboard_report_body *body) {
     if (kb_pending_count >= CONFIG_ZMK_ESB_ENDPOINT_HID_QUIET_KB_QUEUE_DEPTH) {
         memmove(&kb_pending[0], &kb_pending[1],
                 sizeof(kb_pending[0]) *
                     (CONFIG_ZMK_ESB_ENDPOINT_HID_QUIET_KB_QUEUE_DEPTH - 1u));
         kb_pending_count = CONFIG_ZMK_ESB_ENDPOINT_HID_QUIET_KB_QUEUE_DEPTH - 1u;
     }
-    kb_pending[kb_pending_count++] = kb_body;
+    kb_pending[kb_pending_count++] = *body;
 }
 
-static void enqueue_pending_cons(void) {
+static void enqueue_pending_cons_locked(const struct zmk_hid_consumer_report_body *body) {
     if (cons_pending_count >= CONFIG_ZMK_ESB_ENDPOINT_HID_QUIET_CONS_QUEUE_DEPTH) {
         memmove(&cons_pending[0], &cons_pending[1],
                 sizeof(cons_pending[0]) *
                     (CONFIG_ZMK_ESB_ENDPOINT_HID_QUIET_CONS_QUEUE_DEPTH - 1u));
         cons_pending_count = CONFIG_ZMK_ESB_ENDPOINT_HID_QUIET_CONS_QUEUE_DEPTH - 1u;
     }
-    cons_pending[cons_pending_count++] = cons_body;
+    cons_pending[cons_pending_count++] = *body;
 }
 
-static void drain_pending_kb(void) {
-    for (uint8_t i = 0; i < kb_pending_count; i++) {
-        send_kb_body(&kb_pending[i]);
-    }
+/* Drain the queue in arrival order. Snapshot-and-clear under the
+ * scheduler lock, send from the local copy — so a concurrent enqueue
+ * from the other context lands in the (now empty) live queue instead of
+ * being wiped by the count reset, and the lock is never held across a
+ * send. Returns 0 when fully drained; -EAGAIN when the transport went
+ * quiet mid-drain, in which case the unsent tail is re-parked at the
+ * queue head (ahead of anything enqueued meanwhile — the tail is
+ * strictly older) and the caller reschedules the retry worker. On
+ * re-park overflow the oldest tail entries are dropped so the queue
+ * still ends on the latest state. */
+static int drain_pending_kb(void) {
+    struct zmk_hid_keyboard_report_body snap[CONFIG_ZMK_ESB_ENDPOINT_HID_QUIET_KB_QUEUE_DEPTH];
+    k_sched_lock();
+    const uint8_t n = kb_pending_count;
+    memcpy(snap, kb_pending, (size_t)n * sizeof(snap[0]));
     kb_pending_count = 0;
+    k_sched_unlock();
+    for (uint8_t i = 0; i < n; i++) {
+        if (send_kb_body(&snap[i]) != -EAGAIN) {
+            continue;
+        }
+        k_sched_lock();
+        uint8_t tail = n - i;
+        const uint8_t live = kb_pending_count;
+        if (tail + live > CONFIG_ZMK_ESB_ENDPOINT_HID_QUIET_KB_QUEUE_DEPTH) {
+            const uint8_t drop =
+                (uint8_t)(tail + live - CONFIG_ZMK_ESB_ENDPOINT_HID_QUIET_KB_QUEUE_DEPTH);
+            i += drop;
+            tail = (drop >= tail) ? 0u : (uint8_t)(tail - drop);
+        }
+        memmove(&kb_pending[tail], &kb_pending[0], (size_t)live * sizeof(kb_pending[0]));
+        memcpy(&kb_pending[0], &snap[i], (size_t)tail * sizeof(kb_pending[0]));
+        kb_pending_count = (uint8_t)(tail + live);
+        k_sched_unlock();
+        return -EAGAIN;
+    }
+    return 0;
 }
 
-static void drain_pending_cons(void) {
-    for (uint8_t i = 0; i < cons_pending_count; i++) {
-        send_cons_body(&cons_pending[i]);
-    }
+static int drain_pending_cons(void) {
+    struct zmk_hid_consumer_report_body snap[CONFIG_ZMK_ESB_ENDPOINT_HID_QUIET_CONS_QUEUE_DEPTH];
+    k_sched_lock();
+    const uint8_t n = cons_pending_count;
+    memcpy(snap, cons_pending, (size_t)n * sizeof(snap[0]));
     cons_pending_count = 0;
+    k_sched_unlock();
+    for (uint8_t i = 0; i < n; i++) {
+        if (send_cons_body(&snap[i]) != -EAGAIN) {
+            continue;
+        }
+        k_sched_lock();
+        uint8_t tail = n - i;
+        const uint8_t live = cons_pending_count;
+        if (tail + live > CONFIG_ZMK_ESB_ENDPOINT_HID_QUIET_CONS_QUEUE_DEPTH) {
+            const uint8_t drop =
+                (uint8_t)(tail + live - CONFIG_ZMK_ESB_ENDPOINT_HID_QUIET_CONS_QUEUE_DEPTH);
+            i += drop;
+            tail = (drop >= tail) ? 0u : (uint8_t)(tail - drop);
+        }
+        memmove(&cons_pending[tail], &cons_pending[0], (size_t)live * sizeof(cons_pending[0]));
+        memcpy(&cons_pending[0], &snap[i], (size_t)tail * sizeof(cons_pending[0]));
+        cons_pending_count = (uint8_t)(tail + live);
+        k_sched_unlock();
+        return -EAGAIN;
+    }
+    return 0;
 }
 
 static void hid_retry_work_fn(struct k_work *work) {
@@ -207,35 +274,85 @@ static void hid_retry_work_fn(struct k_work *work) {
      * (a kb edge vs a cons edge that fell in the same window) is not
      * preserved — they are independent reports for the host, and
      * media-vs-typing interleaving in a 1-3 ms window is not a real
-     * use case. */
-    drain_pending_kb();
-    drain_pending_cons();
+     * use case. Deliberately not short-circuited: a re-parked kb tail
+     * must not starve the cons drain. */
+    const bool kb_parked = drain_pending_kb() == -EAGAIN;
+    const bool cons_parked = drain_pending_cons() == -EAGAIN;
+    if (kb_parked || cons_parked) {
+        k_work_reschedule(&hid_retry_work,
+                          K_MSEC(CONFIG_ZMK_ESB_ENDPOINT_HID_QUIET_RETRY_MS));
+    }
 }
 
 static void send_keyboard(void) {
+    struct zmk_hid_keyboard_report_body snap;
+    k_sched_lock();
     kb_body.modifiers = explicit_mods | implicit_mods;
+    snap = kb_body;
     if (esb_transport_is_quiet()) {
-        enqueue_pending_kb();
+        enqueue_pending_kb_locked(&snap);
+        k_sched_unlock();
         k_work_reschedule(&hid_retry_work,
                           K_MSEC(CONFIG_ZMK_ESB_ENDPOINT_HID_QUIET_RETRY_MS));
         return;
     }
+    k_sched_unlock();
     /* Quiet ended (or never started): replay queued snapshots in order
      * so the host sees every press/release edge, then send the live
-     * state. No-op when the queue is empty. */
-    drain_pending_kb();
-    send_kb_body(&kb_body);
+     * state. No-op when the queue is empty. The is_quiet() check above
+     * is advisory — the transport can arm a quiet window between it and
+     * the send, in which case -EAGAIN comes back here: park the
+     * snapshot (after any re-parked drain tail, which is strictly
+     * older) and let the retry worker finish the job. */
+    if (drain_pending_kb() == -EAGAIN || send_kb_body(&snap) == -EAGAIN) {
+        k_sched_lock();
+        enqueue_pending_kb_locked(&snap);
+        k_sched_unlock();
+        k_work_reschedule(&hid_retry_work,
+                          K_MSEC(CONFIG_ZMK_ESB_ENDPOINT_HID_QUIET_RETRY_MS));
+    }
 }
 
 static void send_consumer(void) {
+    struct zmk_hid_consumer_report_body snap;
+    k_sched_lock();
+    snap = cons_body;
     if (esb_transport_is_quiet()) {
-        enqueue_pending_cons();
+        enqueue_pending_cons_locked(&snap);
+        k_sched_unlock();
         k_work_reschedule(&hid_retry_work,
                           K_MSEC(CONFIG_ZMK_ESB_ENDPOINT_HID_QUIET_RETRY_MS));
         return;
     }
-    drain_pending_cons();
-    send_cons_body(&cons_body);
+    k_sched_unlock();
+    if (drain_pending_cons() == -EAGAIN || send_cons_body(&snap) == -EAGAIN) {
+        k_sched_lock();
+        enqueue_pending_cons_locked(&snap);
+        k_sched_unlock();
+        k_work_reschedule(&hid_retry_work,
+                          K_MSEC(CONFIG_ZMK_ESB_ENDPOINT_HID_QUIET_RETRY_MS));
+    }
+}
+
+/* Transport delivery-failure resync (fix for retry-exhausted / flushed
+ * reports): an ACKed keyboard or consumer report died undelivered, so
+ * the host may hold a stale edge (stuck key, missed press). Report
+ * state is absolute, so re-sending the current snapshot is idempotent
+ * and converges the host. Runs on the system workqueue; send_keyboard /
+ * send_consumer handle a concurrent quiet window by parking in the
+ * pending rings, and their own TX failure re-arms the resync — bounded
+ * at one in-flight resync per kind, terminating on the first success. */
+static void hid_resync_cb(const uint8_t kinds, void *ctx) {
+    ARG_UNUSED(ctx);
+    if (!zmk_esb_endpoint_is_active() || !pairing_is_connected()) {
+        return;
+    }
+    if (kinds & ESB_HID_RESYNC_KB) {
+        send_keyboard();
+    }
+    if (kinds & ESB_HID_RESYNC_CONS) {
+        send_consumer();
+    }
 }
 
 static int hid_relay_cb(const zmk_event_t *eh) {
@@ -254,13 +371,22 @@ static int hid_relay_cb(const zmk_event_t *eh) {
     static bool was_active;
     if (was_active && !active) {
         k_work_cancel_delayable(&hid_retry_work);
+        k_sched_lock();
         kb_pending_count = 0;
         cons_pending_count = 0;
+        k_sched_unlock();
     }
     was_active = active;
 
     /* Track state unconditionally: keeps the ESB report internally coherent
-     * across profile switches for events we did observe. */
+     * across profile switches for events we did observe. Mutations run
+     * under the scheduler lock so the workqueue-side resync/retry paths
+     * can never snapshot a half-updated report (e.g. a key bit set but
+     * its implicit modifier not yet applied — the host would briefly see
+     * the keycode without its modifier). Sends happen after unlock. */
+    bool want_kb = false;
+    bool want_cons = false;
+    k_sched_lock();
     switch (ev->usage_page) {
     case HID_USAGE_KEY:
         if (is_mod(ev->usage_page, ev->keycode)) {
@@ -281,9 +407,7 @@ static int hid_relay_cb(const zmk_event_t *eh) {
                 mods_dec(implicit_mod_refcount, &implicit_mods, ev->implicit_modifiers);
             }
         }
-        if (active) {
-            send_keyboard();
-        }
+        want_kb = true;
         break;
     case HID_USAGE_CONSUMER:
         if (ev->state) {
@@ -295,17 +419,24 @@ static int hid_relay_cb(const zmk_event_t *eh) {
             mods_dec(explicit_mod_refcount, &explicit_mods, ev->explicit_modifiers);
             mods_dec(implicit_mod_refcount, &implicit_mods, ev->implicit_modifiers);
         }
-        if (active) {
-            /* Consumer keycodes may carry explicit/implicit mods — push a
-             * keyboard report too so modifier state stays in sync. */
-            if (ev->explicit_modifiers || ev->implicit_modifiers) {
-                send_keyboard();
-            }
-            send_consumer();
-        }
+        /* Consumer keycodes may carry explicit/implicit mods — push a
+         * keyboard report too so modifier state stays in sync. */
+        want_kb = (ev->explicit_modifiers || ev->implicit_modifiers);
+        want_cons = true;
         break;
     default:
+        k_sched_unlock();
         return ZMK_EV_EVENT_BUBBLE;
+    }
+    k_sched_unlock();
+
+    if (active) {
+        if (want_kb) {
+            send_keyboard();
+        }
+        if (want_cons) {
+            send_consumer();
+        }
     }
 
     return active ? ZMK_EV_EVENT_HANDLED : ZMK_EV_EVENT_BUBBLE;
@@ -316,6 +447,7 @@ ZMK_SUBSCRIPTION(esb_relay, zmk_keycode_state_changed);
 
 static int hid_relay_init(void) {
     k_work_init_delayable(&hid_retry_work, hid_retry_work_fn);
+    (void)esb_transport_register_hid_resync_cb(hid_resync_cb, NULL);
     return 0;
 }
 

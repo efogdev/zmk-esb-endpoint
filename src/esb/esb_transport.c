@@ -171,6 +171,7 @@ struct pointer_motion_record {
     int16_t scroll_x;
     int16_t scroll_y;
     uint8_t overrode;  /* radio's retransmit_count was lowered for this send */
+    uint8_t hid_kind;  /* enum esb_transport_hid_kind of the matching send */
 };
 static struct pointer_motion_record
     m_recent_motion[CONFIG_ZMK_ESB_ENDPOINT_POINTER_MOTION_RING_SIZE];
@@ -201,6 +202,57 @@ static struct {
  * its in-flight pointer sends along with the queue). The cap that gates
  * back-pressure is CONFIG_ZMK_ESB_ENDPOINT_POINTER_INFLIGHT_CAP. */
 static uint8_t m_pointer_inflight_count;
+
+/* HID delivery-failure resync. When an ACKed HID report dies without
+ * being delivered — retry exhaustion (TX_FAILED) or a TX-FIFO flush
+ * that drops it unsent — the report's kind bit is OR'd into
+ * m_hid_resync_pending (from ISR or thread context) and
+ * m_hid_resync_work is scheduled HID_RESYNC_DELAY_MS out. The work
+ * fetches-and-clears the mask and invokes the registered consumers,
+ * which re-send their current absolute report state. The delay
+ * coalesces a failure burst into one resync and lets a hop's quiet
+ * window arm first; k_work_schedule on an already-pending delayable
+ * keeps the earlier deadline, so a storm of failures still yields one
+ * callback. If the resync send itself dies, its own TX event re-sets
+ * the bit — the loop is bounded at one in-flight resync per report
+ * kind and self-terminates on the first TX_SUCCESS. */
+static atomic_t m_hid_resync_pending;
+static struct k_work_delayable m_hid_resync_work;
+
+#define HID_RESYNC_MAX_CBS 4
+static struct {
+    esb_transport_hid_resync_cb_t cb;
+    void *ctx;
+} m_hid_resync_cbs[HID_RESYNC_MAX_CBS];
+static uint8_t m_hid_resync_cb_count;
+
+int esb_transport_register_hid_resync_cb(const esb_transport_hid_resync_cb_t cb, void *ctx) {
+    if (m_hid_resync_cb_count >= HID_RESYNC_MAX_CBS) {
+        return -ENOMEM;
+    }
+    m_hid_resync_cbs[m_hid_resync_cb_count].cb = cb;
+    m_hid_resync_cbs[m_hid_resync_cb_count].ctx = ctx;
+    m_hid_resync_cb_count++;
+    return 0;
+}
+
+/* Callable from the RADIO ISR and thread context alike. */
+static void hid_resync_request(const uint8_t kinds_mask) {
+    atomic_or(&m_hid_resync_pending, kinds_mask);
+    k_work_schedule(&m_hid_resync_work,
+                    K_MSEC(CONFIG_ZMK_ESB_ENDPOINT_HID_RESYNC_DELAY_MS));
+}
+
+static void hid_resync_work_fn(struct k_work *work) {
+    ARG_UNUSED(work);
+    const uint8_t kinds = (uint8_t)atomic_clear(&m_hid_resync_pending);
+    if (kinds == 0) {
+        return;
+    }
+    for (uint8_t i = 0; i < m_hid_resync_cb_count; i++) {
+        m_hid_resync_cbs[i].cb(kinds, m_hid_resync_cbs[i].ctx);
+    }
+}
 
 #if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_HOP)
 #if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_ADAPTIVE_RETRY)
@@ -346,8 +398,8 @@ static uint16_t jittered_retransmit_delay(void) {
     const int8_t   off  = (int8_t)(m_jitter_rng & 0xFFu);  /* -128..127 */
     const int32_t  delta = ((int32_t)span * off) / 128;
     int32_t d = (int32_t)base + delta;
-    if (d < 100) {
-        d = 100;  /* hard floor — Nordic ESB rejects values below ~50 µs */
+    if (d < 250) {
+        d = 250;
     }
     if (d > UINT16_MAX) {
         d = UINT16_MAX;
@@ -601,9 +653,12 @@ static void motion_refund_apply(struct esb_mouse_body *body) {
 /* Push the (post-refund) motion deltas of an outgoing send onto the ring,
  * matching the slot the next TX event will consume. `overrode` records
  * whether the radio's retransmit_count was lowered for this send so the
- * matching event handler can restore. Non-mouse sends push a zero record
- * to keep head/tail in lockstep with TX events. */
-static void motion_ring_push(const struct esb_mouse_body *body, const bool overrode) {
+ * matching event handler can restore. `hid_kind` classifies the payload
+ * (keyboard/consumer/mouse HID report, or NONE) so a delivery failure
+ * can be reported to the HID resync machinery. Non-mouse sends push a
+ * zero motion record to keep head/tail in lockstep with TX events. */
+static void motion_ring_push(const struct esb_mouse_body *body, const bool overrode,
+                             const uint8_t hid_kind) {
     const uint32_t slot = m_recent_motion_head % CONFIG_ZMK_ESB_ENDPOINT_POINTER_MOTION_RING_SIZE;
     if (body) {
         m_recent_motion[slot].dx       = body->d_x;
@@ -617,6 +672,7 @@ static void motion_ring_push(const struct esb_mouse_body *body, const bool overr
         m_recent_motion[slot].scroll_y = 0;
     }
     m_recent_motion[slot].overrode = overrode ? 1U : 0U;
+    m_recent_motion[slot].hid_kind = hid_kind;
     /* Track in-flight pointer-with-motion sends for back-pressure. Only
      * non-zero-delta pushes count — buttons-only mouse reports and non-
      * mouse sends are recorded for ring/event symmetry but should not
@@ -641,8 +697,7 @@ static void motion_ring_consume(const bool failed) {
     if (m_recent_motion_tail == m_recent_motion_head) {
         return;
     }
-    const uint32_t slot = m_recent_motion_tail %
-        CONFIG_ZMK_ESB_ENDPOINT_POINTER_MOTION_RING_SIZE;
+    const uint32_t slot = m_recent_motion_tail % CONFIG_ZMK_ESB_ENDPOINT_POINTER_MOTION_RING_SIZE;
     const struct pointer_motion_record rec = m_recent_motion[slot];
     m_recent_motion_tail++;
     /* Mirror the push-side count: a slot with non-zero deltas was a
@@ -661,6 +716,14 @@ static void motion_ring_consume(const bool failed) {
             const uint32_t now = k_uptime_get_32();
             m_motion_refund.stamp_ms = (now == 0) ? 1 : now;
         }
+    }
+    /* A failed HID report died undelivered after exhausting its retries.
+     * Motion is repaired by the refund above; edge-triggered state
+     * (keyboard keys, mouse buttons) cannot be — ask the owning HID
+     * layer to re-send its current absolute state. Runs from the RADIO
+     * ISR; hid_resync_request only does atomic_or + k_work_schedule. */
+    if (failed && rec.hid_kind != ESB_HID_KIND_NONE) {
+        hid_resync_request(BIT(rec.hid_kind));
     }
     if (rec.overrode) {
         restore_retransmit_count();
@@ -684,17 +747,64 @@ static void motion_ring_consume(const bool failed) {
  * pick up. set_channel wipes it explicitly afterwards because cross-
  * channel motion is stale by the time the new channel is live.
  */
-static void esb_flush_tx_and_reset(void) {
-    esb_flush_tx();
+static void tx_bookkeeping_resync(void) {
 #if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_HOP)
     m_recent_noack_tail = m_recent_noack_head;
 #endif
 #if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_CRITICAL_MAX_RETRANSMIT)
     m_recent_critical_tail = m_recent_critical_head;
 #endif
+    /* The flushed packets die undelivered exactly like retry-exhausted
+     * ones, but their TX events never fire — harvest the HID kinds of
+     * every outstanding ring slot before the tail snaps forward so the
+     * owning layers re-send current state. Without this, a FIFO-full
+     * flush silently eats queued key/button edges (a flushed press
+     * followed by a delivered release is a keystroke the host never
+     * sees). Iteration is bounded to the ring depth: if head has
+     * outrun the ring (pushes without matching events), the oldest
+     * slots were overwritten and only the newest RING_SIZE are real. */
+    {
+        uint32_t n = m_recent_motion_head - m_recent_motion_tail;
+        if (n > CONFIG_ZMK_ESB_ENDPOINT_POINTER_MOTION_RING_SIZE) {
+            n = CONFIG_ZMK_ESB_ENDPOINT_POINTER_MOTION_RING_SIZE;
+        }
+        uint8_t kinds = 0;
+        for (uint32_t i = 0; i < n; i++) {
+            const uint32_t slot = (m_recent_motion_head - n + i) %
+                                  CONFIG_ZMK_ESB_ENDPOINT_POINTER_MOTION_RING_SIZE;
+            const uint8_t k = m_recent_motion[slot].hid_kind;
+            if (k != ESB_HID_KIND_NONE) {
+                kinds |= (uint8_t)BIT(k);
+            }
+        }
+        if (kinds != 0) {
+            hid_resync_request(kinds);
+        }
+    }
     m_recent_motion_tail = m_recent_motion_head;
     m_pointer_inflight_count = 0;
     restore_retransmit_count();
+}
+
+static void esb_flush_tx_and_reset(void) {
+    esb_flush_tx();
+    tx_bookkeeping_resync();
+}
+
+/* Counterpart of esb_stash_tx() for the paths that park the FIFO across a
+ * temporary disruption (channel hop, rendezvous side-trip) instead of
+ * dropping it. Stashed packets keep their ring slots, inflight count and
+ * retransmit-count overrides — their TX events still arrive once the queue
+ * is restored — so unlike a flush, NO bookkeeping resync happens here.
+ * The -ENOMEM fallback (FIFO refilled between stash and restore; cannot
+ * happen under the k_sched_lock the callers hold, but stay defensive)
+ * degrades to flush semantics: the stash is abandoned and
+ * the bookkeeping
+ * resynced as if the packets had been dropped. */
+static void esb_restore_tx_or_drop(void) {
+    if (esb_restore_tx() < 0) {
+        tx_bookkeeping_resync();
+    }
 }
 
 void esb_transport_flush_tx(void) {
@@ -841,7 +951,13 @@ static void zmk_esb_transport_evt_cb(struct esb_evt const *event) {
             m_sync_tx_result_success = false;
             m_sync_tx_in_progress = false;
             k_sem_give(&m_sync_tx_done);
-            esb_flush_tx_and_reset();
+            /* Bare flush, deliberately without the bookkeeping resync:
+             * the only thing in the FIFO is the failed sync payload
+             * (send_blocking stashed the user queue before writing it),
+             * and it never pushed ring entries. A resync here would
+             * desynchronise the rings from the stashed packets that
+             * send_blocking is about to restore. */
+            esb_flush_tx();
             break;
         }
 #endif
@@ -1005,6 +1121,7 @@ static void install_ram_vtor(void) {
 int esb_transport_init(const esb_transport_cb_t cb) {
     m_cb = cb;
     k_work_init(&rx_work, rx_work_fn);
+    k_work_init_delayable(&m_hid_resync_work, hid_resync_work_fn);
 #if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_RENDEZVOUS)
     k_sem_init(&m_sync_tx_done, 0, 1);
 #endif
@@ -1056,13 +1173,18 @@ int esb_transport_set_channel(const uint8_t channel) {
      * does not block the hop. */
     z_nrf_clock_calibration_force_start();
 
-    /* Drain any queued packets on the old channel — retransmits on the new
-     * channel would arrive at a peer that has not yet hopped. The helper
-     * also drains the noack/critical/motion rings, zeroes the inflight
-     * pointer count, and restores the radio's retransmit_count, so any
-     * critical- or pointer-override packet that got dropped by the flush
-     * does not strand the radio at the override value. */
-    esb_flush_tx_and_reset();
+    /* Park any queued packets instead of dropping them. Retransmits on
+     * the new channel would arrive at a peer that has not yet hopped, so
+     * the FIFO must be empty while we retune — but the packets themselves
+     * (queued HID reports, shell bytes) are still worth delivering once
+     * the peer has followed. The stash keeps them, PIDs included; they go
+     * back into the FIFO below and leave the radio when the first send
+     * after the post-hop quiet window kicks start_tx. Because the packets
+     * are restored (their TX events still arrive), the noack/critical/
+     * motion rings, the inflight count and any retransmit-count override
+     * are deliberately left alone — resyncing them here (as the old flush
+     * did) would desynchronise the rings from the restored queue. */
+    (void)esb_stash_tx();
 
     /* esb_set_rf_channel() requires ESB_STATE_IDLE. With
      * CONFIG_ESB_NEVER_DISABLE_TX the radio can stay hot (PTX_TXIDLE /
@@ -1083,10 +1205,18 @@ int esb_transport_set_channel(const uint8_t channel) {
     }
 #endif
     if (err) {
+        /* Retune failed — the radio is still on the old channel, where
+         * the stashed packets remain valid. Put them back. */
+        esb_restore_tx_or_drop();
         k_sched_unlock();
         return err;
     }
     m_addr.channel = channel;
+    /* Re-queue the parked packets on the new channel. Passive: restore
+     * does not kick the radio, so nothing transmits until the first
+     * send after the quiet window below calls esb_write_payload, which
+     * starts TX with the restored packets at the front of the queue. */
+    esb_restore_tx_or_drop();
     consecutive_tx_fail = 0;
     /* Peer's RSSI view is per-link, not per-channel — the peer samples
      * over its own radio which now has to re-establish contact. Invalidate
@@ -1111,9 +1241,10 @@ int esb_transport_set_channel(const uint8_t channel) {
      * (post-quiet window + peer catch-up), so additionally drop any
      * pending pointer refund — adding it to the next mouse report would
      * teleport the cursor. Matches the input processor's accumulator
-     * clear at the same moment. The motion ring tail and inflight count
-     * are already wiped by esb_flush_tx_and_reset above; only the refund
-     * pool is unique to the channel-change path. */
+     * clear at the same moment. The motion ring and inflight count are
+     * left intact — the stashed packets were restored above and their
+     * TX events will consume those slots; only the refund pool (already-
+     * failed motion) is dropped on the channel-change path. */
     m_motion_refund.dx = 0;
     m_motion_refund.dy = 0;
     m_motion_refund.scroll_x = 0;
@@ -1248,13 +1379,16 @@ int esb_transport_send(const uint8_t pipe, const uint8_t *data, uint8_t len) {
         (data[0] == ESB_PKT_SHELL_DATA || data[0] == ESB_PKT_SHELL_POLL || data[0] == ESB_PKT_SHELL_STOP);
 
 #if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_RENDEZVOUS)
-    /* Drop any user-thread send while a synchronous side-trip is on the
-     * radio. The rendezvous send temporarily flips RADIO->FREQUENCY to
-     * another channel; queueing a user packet here would let the ESB
+    /* Refuse any user-thread send while a synchronous side-trip is on
+     * the radio. The rendezvous send temporarily flips RADIO->FREQUENCY
+     * to another channel; queueing a user packet here would let the ESB
      * state machine TX it on the wrong channel. The window is bounded
-     * by RENDEZVOUS_TIMEOUT_MS (a few ms). */
+     * by RENDEZVOUS_TIMEOUT_MS (a few ms). -EAGAIN (not fake success)
+     * so edge-carrying callers can park the report in their pending
+     * queues — this return is the authoritative version of the
+     * advisory esb_transport_is_quiet() pre-check. */
     if (m_sync_tx_in_progress) {
-        return is_shell ? -EAGAIN : 0;
+        return -EAGAIN;
     }
 #endif
 
@@ -1275,16 +1409,20 @@ int esb_transport_send(const uint8_t pipe, const uint8_t *data, uint8_t len) {
 
 #if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_HOP)
     /* Post-hop quiet window: the peer needs a moment to follow us to
-     * the new channel. Silently drop user traffic until the deadline —
-     * 32-bit wrap-safe compare. Losing CHANNEL_HOP_POST_QUIET_MS worth of
-     * HID reports is strictly better than queueing them for a channel the
-     * receiver hasn't reached yet, where every attempt would just count
-     * as a failure. */
+     * the new channel. Refuse user traffic until the deadline — 32-bit
+     * wrap-safe compare. Not queueing for CHANNEL_HOP_POST_QUIET_MS is
+     * strictly better than transmitting to a channel the receiver
+     * hasn't reached yet, where every attempt would just count as a
+     * failure. -EAGAIN (not fake success): this check runs under the
+     * same k_sched_lock that arms the window, so it is the
+     * authoritative answer for callers whose advisory is_quiet()
+     * pre-check raced the hop worker — they re-enqueue the report
+     * instead of losing the edge. */
     if (m_tx_quiet_until_ms != 0) {
         const uint32_t now = k_uptime_get_32();
         if ((int32_t)(m_tx_quiet_until_ms - now) > 0) {
             k_sched_unlock();
-            return is_shell ? -EAGAIN : 0;
+            return -EAGAIN;
         }
         m_tx_quiet_until_ms = 0;
     }
@@ -1337,8 +1475,7 @@ int esb_transport_send(const uint8_t pipe, const uint8_t *data, uint8_t len) {
      * the next tail entry, which now corresponds to the post-flush
      * send — at worst we mis-attribute one packet's noack-ness, which
      * the wide window absorbs). */
-    m_recent_noack[m_recent_noack_head & (CONFIG_ZMK_ESB_ENDPOINT_LINK_QUALITY_NOACK_RING_SIZE - 1)] =
-        noack ? 1U : 0U;
+    m_recent_noack[m_recent_noack_head & (CONFIG_ZMK_ESB_ENDPOINT_LINK_QUALITY_NOACK_RING_SIZE - 1)] = noack ? 1U : 0U;
     m_recent_noack_head++;
 #endif
 
@@ -1424,6 +1561,22 @@ int esb_transport_send(const uint8_t pipe, const uint8_t *data, uint8_t len) {
      * the send is noack (HID_NOACK=y): noack TX events are not retried
      * by the radio at all, but esb_set_retransmit_count is still cheap
      * and the field stays consistent for the next ACKed send. */
+    /* Classify HID payloads so a delivery failure (retry exhaustion or
+     * FIFO flush) can be routed back to the layer owning the report
+     * state. Noack mouse sends stay NONE: the radio never reports a
+     * failure for them, so a resync request could never fire anyway,
+     * and flush-harvesting them would only produce spurious (if
+     * idempotent) resyncs for a stream that self-corrects. */
+    uint8_t hid_kind = ESB_HID_KIND_NONE;
+    if (len >= 2 && data[0] == ESB_PKT_HID_REPORT && !noack) {
+        switch (data[1]) {
+        case ESB_REPORT_KEYBOARD: hid_kind = ESB_HID_KIND_KB;    break;
+        case ESB_REPORT_CONSUMER: hid_kind = ESB_HID_KIND_CONS;  break;
+        case ESB_REPORT_MOUSE:    hid_kind = ESB_HID_KIND_MOUSE; break;
+        default: break;
+        }
+    }
+
     bool pointer_override = false;
     if (is_mouse_report(data, len)) {
         struct esb_mouse_body *body = mouse_body_of(pkt.data);
@@ -1435,9 +1588,9 @@ int esb_transport_send(const uint8_t pipe, const uint8_t *data, uint8_t len) {
             (void)esb_set_retransmit_count(
                 CONFIG_ZMK_ESB_ENDPOINT_POINTER_RETRANSMIT_COUNT);
         }
-        motion_ring_push(body, pointer_override);
+        motion_ring_push(body, pointer_override, hid_kind);
     } else {
-        motion_ring_push(NULL, false);
+        motion_ring_push(NULL, false, hid_kind);
     }
 
     const int ret = esb_write_payload(&pkt);
@@ -1460,20 +1613,29 @@ int esb_transport_send_blocking(const uint8_t channel, const uint8_t pipe,
     }
 
     /* esb_set_rf_channel only updates an internal struct field; the radio
-     * picks up the new frequency on the next ramp-up. So a flush_tx +
+     * picks up the new frequency on the next ramp-up. So a stash_tx +
      * channel_set + write_payload sequence guarantees that the next packet
      * to leave is ours, on the channel we just set. After completion the
-     * inverse restore returns the radio to the active channel for the
-     * very next user-thread send (which we held off via m_sync_tx_in_progress
+     * inverse restore returns the radio to the active channel — and puts
+     * the stashed user packets back in the queue — for the very next
+     * user-thread send (which we held off via m_sync_tx_in_progress
      * during the round trip). m_addr.channel is left untouched throughout —
      * we are visiting, not committing. The setup and restore sections run
      * with preemption disabled so no other thread can slip a send onto the
-     * transient channel; the lock is dropped around the semaphore wait. */
+     * transient channel; the lock is dropped around the semaphore wait.
+     *
+     * The stash keeps the parked packets' ring slots / inflight count /
+     * retransmit override live (their TX events still arrive after the
+     * restore), and the sync packet itself never touches the rings (both
+     * ISR branches bail out on m_sync_tx_in_progress before the ring
+     * consumption), so no bookkeeping resync happens anywhere on this
+     * round trip. */
     k_sched_lock();
-    esb_flush_tx_and_reset();
+    (void)esb_stash_tx();
 
     const int chan_err = esb_set_rf_channel(channel);
     if (chan_err) {
+        esb_restore_tx_or_drop();
         k_sched_unlock();
         return chan_err;
     }
@@ -1493,6 +1655,8 @@ int esb_transport_send_blocking(const uint8_t channel, const uint8_t pipe,
     if (werr) {
         m_sync_tx_in_progress = false;
         (void)esb_set_rf_channel(m_addr.channel);
+        esb_restore_tx_or_drop();
+        (void)esb_start_tx();
         k_sched_unlock();
         return werr;
     }
@@ -1506,6 +1670,14 @@ int esb_transport_send_blocking(const uint8_t channel, const uint8_t pipe,
      * on timeout we clear it here so the next caller is unblocked. */
     k_sched_lock();
     (void)esb_set_rf_channel(m_addr.channel);
+
+    /* Put the parked user packets back and kick the radio so they leave
+     * on the active channel now, not at the next user send. On timeout
+     * the sync payload may still occupy the FIFO front mid-retransmit —
+     * esb_start_tx then reports -EBUSY and the restored packets ride out
+     * behind it once the radio settles; both benign. */
+    esb_restore_tx_or_drop();
+    (void)esb_start_tx();
 
     if (wait_err) {
         m_sync_tx_in_progress = false;

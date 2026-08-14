@@ -2292,6 +2292,88 @@ int esb_flush_tx(void)
 	return 0;
 }
 
+/* Parking area for esb_stash_tx() / esb_restore_tx(). Holds a snapshot of
+ * the TX FIFO in queue order (front first). PTX mode only — PRX queues ACK
+ * payloads through ack_pl_wrap, not the payload ring.
+ */
+static struct esb_payload tx_stash[CONFIG_ESB_TX_FIFO_SIZE];
+static uint32_t tx_stash_count;
+
+int esb_stash_tx(void)
+{
+	if (!esb_initialized) {
+		return -EACCES;
+	}
+	if (esb_cfg.mode != ESB_MODE_PTX) {
+		return -ENOTSUP;
+	}
+
+	unsigned int key = irq_lock();
+
+	uint32_t idx = tx_fifo.front;
+
+	tx_stash_count = tx_fifo.count;
+	for (uint32_t i = 0; i < tx_stash_count; i++) {
+		memcpy(&tx_stash[i], tx_fifo.payload[idx],
+		       sizeof(struct esb_payload));
+		if (++idx >= CONFIG_ESB_TX_FIFO_SIZE) {
+			idx = 0;
+		}
+	}
+
+	tx_fifo.count = 0;
+	tx_fifo.back = 0;
+	tx_fifo.front = 0;
+
+	irq_unlock(key);
+
+	return (int)tx_stash_count;
+}
+
+int esb_restore_tx(void)
+{
+	if (!esb_initialized) {
+		return -EACCES;
+	}
+	if (esb_cfg.mode != ESB_MODE_PTX) {
+		return -ENOTSUP;
+	}
+
+	unsigned int key = irq_lock();
+
+	if (tx_stash_count == 0) {
+		irq_unlock(key);
+		return 0;
+	}
+	if ((tx_fifo.count + tx_stash_count) > CONFIG_ESB_TX_FIFO_SIZE) {
+		irq_unlock(key);
+		return -ENOMEM;
+	}
+
+	/* Raw copy, not esb_write_payload(): the stashed payloads already
+	 * carry their assigned PIDs. Re-using them keeps the peer's
+	 * retransmit detection (same PID + CRC) correct for a packet that
+	 * was transmitted but not yet acknowledged when it was stashed,
+	 * and leaves the pids[] counters in step with what is on air.
+	 */
+	for (uint32_t i = 0; i < tx_stash_count; i++) {
+		memcpy(tx_fifo.payload[tx_fifo.back], &tx_stash[i],
+		       sizeof(struct esb_payload));
+		if (++tx_fifo.back >= CONFIG_ESB_TX_FIFO_SIZE) {
+			tx_fifo.back = 0;
+		}
+		tx_fifo.count++;
+	}
+
+	int restored = (int)tx_stash_count;
+
+	tx_stash_count = 0;
+
+	irq_unlock(key);
+
+	return restored;
+}
+
 int esb_pop_tx(void)
 {
 	if (!esb_initialized) {
