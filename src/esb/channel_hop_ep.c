@@ -577,6 +577,9 @@ static void persist_load(void) {
     m_decay_frac_ms = 0;
     m_decay_last_uptime = k_uptime_get_32();
     m_saved_accum_min = 0;
+#if IS_ENABLED(CONFIG_ZMK_RUNTIME_CONFIG)
+    zrc_register(PERSIST_ZRC_KEY, PERSIST_N_MAX, 0, PERSIST_N_MAX);
+#endif
 #endif
     settings_subsys_init();
     settings_load_subtree("esb_hop");
