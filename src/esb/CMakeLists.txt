@@ -1,6 +1,7 @@
 target_sources_ifdef(CONFIG_ZMK_ESB_ENDPOINT app PRIVATE
     esb_endpoint.c
     esb_transport.c
+    radio_arbiter.c
     pairing.c
     hid_relay.c
     channel_hop.c

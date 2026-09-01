@@ -3,12 +3,7 @@ zephyr_include_directories(include)
 zephyr_compile_options(-Wno-address-of-packed-member)
 
 if(CONFIG_ZMK_ESB_ENDPOINT)
-    zephyr_link_libraries(-Wl,--wrap=bt_le_adv_start)
-    zephyr_link_libraries(-Wl,--wrap=bt_le_adv_update_data)
     zephyr_link_libraries(-Wl,--wrap=bt_le_adv_start_legacy)
-    zephyr_link_libraries(-Wl,--wrap=zmk_hog_send_keyboard_report)
-    zephyr_link_libraries(-Wl,--wrap=zmk_hog_send_consumer_report)
-    zephyr_link_libraries(-Wl,--wrap=zmk_hog_send_mouse_report)
 
     set(NRFXLIB_DIR ${CMAKE_CURRENT_LIST_DIR}/vendor/nrfxlib)
     zephyr_include_directories(${NRFXLIB_DIR}/mpsl/include)

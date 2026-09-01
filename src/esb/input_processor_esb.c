@@ -290,11 +290,6 @@ static int esb_ip_handle_event(const struct device *dev, struct input_event *eve
     bool button_changed = false;
     switch (event->type) {
     case INPUT_EV_REL:
-        /* Stamp the accumulator's start uptime on first delta after a
-         * flush so the staleness check in send_mouse_report has an
-         * anchor. Zero is the "empty" sentinel — if k_uptime happens
-         * to return 0 at this instant, bias to 1 so !=0 stays
-         * truthful. */
         if (d->accum_start_ms == 0) {
             const uint32_t now = k_uptime_get_32();
             d->accum_start_ms = (now == 0) ? 1 : now;

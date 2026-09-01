@@ -78,40 +78,6 @@ static void disconnect_conn_cb(struct bt_conn *conn, void *data)
     bt_conn_disconnect(conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
 }
 
-/* Profile has no bonded peer, so ZMK's update_advertising() permanently wants
- * ZMK_ADV_CONN. Every disconnect/endpoint/profile-change event re-submits
- * update_advertising_work, which calls bt_le_adv_start(); the BT Controller
- * then schedules adv events that clobber ESB's RADIO config. Intercept the
- * start via --wrap=bt_le_adv_start (see CMakeLists.txt) and no-op while ESB
- * owns the radio. This removes the race at the source — ZMK still thinks it
- * started adv and tracks its advertising_status accordingly, so the normal
- * BLE flow resumes once esb_active clears. */
-int __real_bt_le_adv_start(const struct bt_le_adv_param *param,
-                           const struct bt_data *ad, size_t ad_len,
-                           const struct bt_data *sd, size_t sd_len);
-
-int __wrap_bt_le_adv_start(const struct bt_le_adv_param *param,
-                           const struct bt_data *ad, const size_t ad_len,
-                           const struct bt_data *sd, const size_t sd_len) {
-    if (esb_active) {
-        return 0;
-    }
-    return __real_bt_le_adv_start(param, ad, ad_len, sd, sd_len);
-}
-
-int __real_bt_le_adv_update_data(const struct bt_data *ad, size_t ad_len,
-                                 const struct bt_data *sd, size_t sd_len);
-
-int __wrap_bt_le_adv_update_data(const struct bt_data *ad, const size_t ad_len,
-                                 const struct bt_data *sd, const size_t sd_len) {
-    if (esb_active) {
-        return 0;
-    }
-    return __real_bt_le_adv_update_data(ad, ad_len, sd, sd_len);
-}
-
-/* bt_le_adv_start_legacy is a private host function (no public header); reached
- * via bt_le_adv_resume() on disconnect — wrap it too so resumes stay quiet. */
 struct bt_le_ext_adv;
 int __real_bt_le_adv_start_legacy(struct bt_le_ext_adv *adv,
                                   const struct bt_le_adv_param *param,
@@ -128,50 +94,22 @@ int __wrap_bt_le_adv_start_legacy(struct bt_le_ext_adv *adv,
     return __real_bt_le_adv_start_legacy(adv, param, ad, ad_len, sd, sd_len);
 }
 
-/* While ESB owns the radio the active BLE profile has no peer (BT_ADDR_LE_ANY),
- * yet endpoints.c keeps routing HID reports to HoG: with USB unplugged and BLE
- * "not ready", get_selected_transport() falls through to DEFAULT_TRANSPORT,
- * which is BLE whenever CONFIG_ZMK_BLE=y. Each queued report then runs
- * zmk_ble_active_profile_conn(), which logs a LOG_WRN per call. Drop the
- * reports at the entrypoint so nothing enters hog_work_q and the BLE LL is
- * never touched. */
-int __real_zmk_hog_send_keyboard_report(struct zmk_hid_keyboard_report_body *body);
-int __wrap_zmk_hog_send_keyboard_report(struct zmk_hid_keyboard_report_body *body) {
-    if (esb_active) {
-        return 0;
-    }
-    return __real_zmk_hog_send_keyboard_report(body);
+bool zmk_ble_radio_yielded(void) {
+    return esb_active;
 }
 
-int __real_zmk_hog_send_consumer_report(struct zmk_hid_consumer_report_body *body);
-int __wrap_zmk_hog_send_consumer_report(struct zmk_hid_consumer_report_body *body) {
-    if (esb_active) {
-        return 0;
+void zmk_ble_on_ready(void) {
+    if (zmk_ble_active_profile_index() == (ZMK_BLE_PROFILE_COUNT - 1)) {
+        const int cmd = ESB_CMD_ACTIVATE;
+        k_msgq_put(&esb_ctrl_msgq, &cmd, K_NO_WAIT);
     }
-    return __real_zmk_hog_send_consumer_report(body);
 }
-
-#if IS_ENABLED(CONFIG_ZMK_POINTING)
-int __real_zmk_hog_send_mouse_report(struct zmk_hid_mouse_report_body *body);
-int __wrap_zmk_hog_send_mouse_report(struct zmk_hid_mouse_report_body *body) {
-    if (esb_active) {
-        return 0;
-    }
-    return __real_zmk_hog_send_mouse_report(body);
-}
-#endif
 
 static void esb_ctrl_thread_fn(void *p1, void *p2, void *p3) {
     int cmd;
     while (1) {
         k_msgq_get(&esb_ctrl_msgq, &cmd, K_FOREVER);
         if (cmd == ESB_CMD_ACTIVATE) {
-            /* Quiesce the BLE LL instead of tearing down the whole stack:
-             *   - disconnect active peers (LL stops conn events)
-             *   - stop advertising (LL stops adv events)
-             * With no scheduled radio work the LL will not touch RADIO, and the
-             * VTOR swap in esb_transport_on_slot_start() redirects the IRQ to ESB.
-             * This avoids the settings-flush storm triggered by bt_disable(). */
             bt_conn_foreach(BT_CONN_TYPE_LE, disconnect_conn_cb, NULL);
             bt_le_adv_stop();
             k_sleep(K_MSEC(CONFIG_ZMK_ESB_ENDPOINT_BLE_QUIESCE_MS));
@@ -194,18 +132,6 @@ static void esb_ctrl_thread_fn(void *p1, void *p2, void *p3) {
             esb_transport_on_slot_stop();
             pairing_stop();
             esb_transport_deinit();
-            /* Resync ZMK's static advertising_status with reality. Our wrap
-             * returned 0 on the last bt_le_adv_start, so ZMK believes adv is
-             * running; a bare bt_le_adv_stop() here would not flip that state
-             * and update_advertising() would then no-op (desired==current==CONN),
-             * leaving the new BLE slot unreachable. zmk_ble_set_device_name()
-             * with CONFIG_BT_DEVICE_NAME is idempotent on bt_set_name() and
-             * runs the exact reset path we need: stops adv, clears
-             * advertising_status to NONE, then calls update_advertising() which
-             * starts adv for real (esb_active is now false, so the wrap is
-             * transparent). zmk_ble_active_profile_name() would return an empty
-             * string — ZMK never populates profiles[i].name — which bt_set_name()
-             * would then apply, making the device advertise without a name. */
             zmk_ble_set_device_name((char *)CONFIG_BT_DEVICE_NAME);
         }
     }
@@ -232,19 +158,6 @@ static int profile_listener_cb(const zmk_event_t *eh) {
 ZMK_LISTENER(zmk_esb_endpoint_listener, profile_listener_cb);
 ZMK_SUBSCRIPTION(zmk_esb_endpoint_listener, zmk_ble_active_profile_changed);
 
-/* ZMK does not raise zmk_ble_active_profile_changed for the profile loaded from
- * settings at boot — the event only fires on user switches and connect/disconnect.
- * Poll once after settings have loaded so booting with the ESB slot selected
- * actually activates ESB. */
-static void boot_profile_check_fn(struct k_work *work) {
-    ARG_UNUSED(work);
-    if (zmk_ble_active_profile_index() == (ZMK_BLE_PROFILE_COUNT - 1) && !esb_active) {
-        const int cmd = ESB_CMD_ACTIVATE;
-        k_msgq_put(&esb_ctrl_msgq, &cmd, K_NO_WAIT);
-    }
-}
-static K_WORK_DELAYABLE_DEFINE(boot_profile_check_work, boot_profile_check_fn);
-
 static int esb_endpoint_init(void) {
     esb_transport_init(on_transport_evt);
     pairing_init();
@@ -258,8 +171,6 @@ static int esb_endpoint_init(void) {
     k_thread_create(&esb_ctrl_thread, esb_ctrl_stack, K_THREAD_STACK_SIZEOF(esb_ctrl_stack),
                     esb_ctrl_thread_fn, NULL, NULL, NULL, K_PRIO_COOP(CONFIG_ZMK_ESB_ENDPOINT_CTRL_THREAD_PRIORITY), 0, K_NO_WAIT);
     k_thread_name_set(&esb_ctrl_thread, "esb_ctrl");
-
-    k_work_schedule(&boot_profile_check_work, K_MSEC(CONFIG_ZMK_ESB_ENDPOINT_BOOT_CHECK_DELAY_MS));
     return 0;
 }
 
