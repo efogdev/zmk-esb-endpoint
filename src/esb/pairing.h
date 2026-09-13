@@ -24,3 +24,4 @@ void pairing_on_rx(const uint8_t *data, uint8_t len);
 
 pairing_state_t pairing_get_state(void);
 bool pairing_is_connected(void);
+bool pairing_has_stored_peer(void);

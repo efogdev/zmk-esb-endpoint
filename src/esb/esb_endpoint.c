@@ -52,7 +52,7 @@ bool zmk_esb_endpoint_is_active(void) {
     return esb_active;
 }
 
-static void configure_esb_addresses(void) {
+static void configure_esb_addresses(const uint8_t channel) {
     static const uint8_t base_addr_0[4] = DT_INST_PROP(0, pairing_base_address);
     static const uint8_t base_addr_1[4] = DT_INST_PROP(0, data_base_address);
     static const uint8_t prefixes[8]    = {
@@ -61,7 +61,7 @@ static void configure_esb_addresses(void) {
         0xC3, 0xC4, 0xC5, 0xC6, 0xC7, 0xC8,
     };
 
-    esb_transport_set_addresses(base_addr_0, base_addr_1, prefixes, DT_INST_PROP(0, esb_channel));
+    esb_transport_set_addresses(base_addr_0, base_addr_1, prefixes, channel);
 }
 
 static void on_transport_evt(const esb_transport_evt_t *evt) {
@@ -100,7 +100,11 @@ bool zmk_ble_radio_yielded(void) {
 
 void zmk_ble_on_ready(void) {
     if (zmk_ble_active_profile_index() == (ZMK_BLE_PROFILE_COUNT - 1)) {
+#if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_HOP)
+        const int cmd = ESB_CMD_ACTIVATE_BOOT;
+#else
         const int cmd = ESB_CMD_ACTIVATE;
+#endif
         k_msgq_put(&esb_ctrl_msgq, &cmd, K_NO_WAIT);
     }
 }
@@ -109,13 +113,29 @@ static void esb_ctrl_thread_fn(void *p1, void *p2, void *p3) {
     int cmd;
     while (1) {
         k_msgq_get(&esb_ctrl_msgq, &cmd, K_FOREVER);
-        if (cmd == ESB_CMD_ACTIVATE) {
+        if (cmd == ESB_CMD_ACTIVATE || cmd == ESB_CMD_ACTIVATE_BOOT) {
+            LOG_DBG("ESB activate requested at %u ms", k_uptime_get_32());
             bt_conn_foreach(BT_CONN_TYPE_LE, disconnect_conn_cb, NULL);
             bt_le_adv_stop();
             k_sleep(K_MSEC(CONFIG_ZMK_ESB_ENDPOINT_BLE_QUIESCE_MS));
-            configure_esb_addresses();
+            configure_esb_addresses(DT_INST_PROP(0, esb_channel));
             esb_transport_on_slot_start();
             k_sleep(K_MSEC(1));
+            LOG_DBG("ESB addresses configured at %u ms", k_uptime_get_32());
+#if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_HOP)
+            if (cmd == ESB_CMD_ACTIVATE_BOOT && pairing_has_stored_peer()) {
+                const uint8_t saved = channel_hop_ep_get_boot_channel();
+                if (saved != CHANNEL_HOP_INVALID && saved != esb_transport_get_channel()) {
+                    const int err = esb_transport_set_channel(saved);
+                    if (err) {
+                        LOG_ERR("boot retune to saved channel %u failed: %d", saved, err);
+                    } else {
+                        LOG_DBG("booted directly into ESB slot, paired; retuned to saved channel %u", saved);
+                        channel_hop_ep_arm_boot_verify();
+                    }
+                }
+            }
+#endif
             pairing_start();
             esb_active = true;
 #if IS_ENABLED(CONFIG_ZMK_ADAPTIVE_FEEDBACK)

@@ -501,6 +501,19 @@ config ZMK_ESB_ENDPOINT_CHANNEL_HOP
 
 if ZMK_ESB_ENDPOINT_CHANNEL_HOP
 
+config ZMK_ESB_ENDPOINT_BOOT_CHANNEL_VERIFY_MS
+    int "Boot-channel verify window before reverting to default (ms)"
+    default 500
+    range 50 5000
+    help
+      When the device boots directly into the ESB slot already paired,
+      it retunes straight to the last channel a hop was persisted to
+      instead of starting cold on the DTS default channel. If no
+      TX_SUCCESS arrives within this many milliseconds of that retune,
+      the saved channel is stale (dongle moved on, environment changed)
+      — revert to the default channel and persist it, so the next boot
+      does not repeat the same failed guess.
+
 config ZMK_ESB_ENDPOINT_HOP_RETRY_DELAY_MS
     int "Hop-worker re-arm delay after esb_transport_set_channel -EBUSY (ms)"
     default 2 if ZMK_ESB_ENDPOINT_CRITICAL_MAX_RETRANSMIT

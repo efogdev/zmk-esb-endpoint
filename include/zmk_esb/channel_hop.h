@@ -12,8 +12,14 @@
 #include <stdint.h>
 #include <stdbool.h>
 
-#define ESB_CMD_ACTIVATE   1
-#define ESB_CMD_DEACTIVATE 2
+#define ESB_CMD_ACTIVATE      1
+#define ESB_CMD_DEACTIVATE    2
+/* Same as ESB_CMD_ACTIVATE, but only ever posted once at boot when the
+ * device powers on with the ESB slot already active — as opposed to a
+ * live profile switch into it during an already-running session. Lets
+ * the activation handler retune directly to the last-known-good channel
+ * instead of starting cold on the DTS default. */
+#define ESB_CMD_ACTIVATE_BOOT 3
 
 /* ESB supports channels 0..100 (2400..2500 MHz in 1 MHz steps). */
 #define CHANNEL_HOP_CHANNEL_COUNT 101

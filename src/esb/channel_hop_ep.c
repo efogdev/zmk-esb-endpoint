@@ -8,10 +8,7 @@
 #include <zmk_esb/channel_hop.h>
 #include "channel_hop_ep.h"
 #include "esb_transport.h"
-
-#if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_QUARANTINE_PERSIST) || IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_RSSI_WEIGHT)
 #include <zephyr/settings/settings.h>
-#endif
 
 #include <zephyr/logging/log.h>
 
@@ -62,6 +59,10 @@ static struct quarantine_state m_quarantine;
 static struct channel_rssi_state m_channel_rssi;
 static uint8_t m_committed_next = CHANNEL_HOP_INVALID;
 static bool m_link_up;
+
+#define BOOT_CHANNEL_SETTINGS_KEY "esb_hopch/chan"
+static uint8_t m_boot_channel = CHANNEL_HOP_INVALID;
+static uint8_t m_saved_channel = CHANNEL_HOP_INVALID;
 
 /* True iff the current m_committed_next has been acknowledged by the
  * dongle via CONFIRM AND nothing has happened since that could have
@@ -568,6 +569,67 @@ static int persist_settings_load_cb(const char *name, const size_t len,
 
 SETTINGS_STATIC_HANDLER_DEFINE(esb_hop, "esb_hop", NULL, persist_settings_load_cb, NULL, NULL);
 
+static int boot_channel_settings_load_cb(const char *name, const size_t len, const settings_read_cb read_cb, void *cb_arg) {
+    if (settings_name_steq(name, "chan", NULL) && len == sizeof(uint8_t)) {
+        uint8_t ch;
+        if (read_cb(cb_arg, &ch, sizeof(ch)) >= 0 && ch < CHANNEL_HOP_CHANNEL_COUNT) {
+            m_boot_channel = ch;
+            m_saved_channel = ch;
+        }
+    }
+    return 0;
+}
+
+SETTINGS_STATIC_HANDLER_DEFINE(esb_hopch, "esb_hopch", NULL, boot_channel_settings_load_cb, NULL, NULL);
+
+static void persist_boot_channel(const uint8_t channel) {
+    if (channel == m_saved_channel) {
+        return;
+    }
+    settings_save_one(BOOT_CHANNEL_SETTINGS_KEY, &channel, sizeof(channel));
+    m_saved_channel = channel;
+}
+
+uint8_t channel_hop_ep_get_boot_channel(void) {
+    return m_boot_channel;
+}
+
+static struct k_work_delayable boot_verify_work;
+static volatile bool m_boot_verify_armed;
+
+/* Fires CONFIG_ZMK_ESB_ENDPOINT_BOOT_CHANNEL_VERIFY_MS after retuning to a
+ * persisted boot channel. If channel_hop_ep_on_tx_success_isr() hasn't
+ * disarmed it by then, the saved channel is stale — fall back to the
+ * default (rendezvous) channel and persist that instead, so the next boot
+ * doesn't repeat the same failed guess. */
+static void boot_verify_work_fn(struct k_work *w) {
+    ARG_UNUSED(w);
+    if (!m_boot_verify_armed) {
+        return;
+    }
+    m_boot_verify_armed = false;
+
+    const uint8_t rendezvous = esb_transport_get_rendezvous_channel();
+    const uint8_t current = esb_transport_get_channel();
+    if (current == rendezvous) {
+        return;
+    }
+
+    LOG_DBG("no TX success on saved boot channel %u within %ums; reverting to default %u",
+            current, (unsigned)CONFIG_ZMK_ESB_ENDPOINT_BOOT_CHANNEL_VERIFY_MS, rendezvous);
+    const int err = esb_transport_set_channel(rendezvous);
+    if (err) {
+        LOG_ERR("boot channel revert %u -> %u failed: %d", current, rendezvous, err);
+        return;
+    }
+    persist_boot_channel(rendezvous);
+}
+
+void channel_hop_ep_arm_boot_verify(void) {
+    m_boot_verify_armed = true;
+    k_work_reschedule(&boot_verify_work, K_MSEC(CONFIG_ZMK_ESB_ENDPOINT_BOOT_CHANNEL_VERIFY_MS));
+}
+
 static void persist_load(void) {
 #if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_QUARANTINE_PERSIST)
     m_hit_count = 0;
@@ -970,11 +1032,12 @@ static void commit_hop_bookkeeping(const uint8_t prev, const uint32_t quarantine
         m_prev_known_channel = prev;
     }
 
+    persist_boot_channel(esb_transport_get_channel());
+
     m_committed_next = CHANNEL_HOP_INVALID;
     m_committed_synced = false;
 
-    m_hop_cooldown_until = k_uptime_get_32() +
-        CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_HOP_COOLDOWN_MS;
+    m_hop_cooldown_until = k_uptime_get_32() + CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_HOP_COOLDOWN_MS;
 
     {
         const uint32_t now = k_uptime_get_32();
@@ -1288,6 +1351,10 @@ void channel_hop_ep_on_link_degraded_isr(void) {
 void channel_hop_ep_init(void) {
     quarantine_reset(&m_quarantine);
     channel_rssi_reset(&m_channel_rssi);
+    settings_subsys_init();
+    settings_load_subtree("esb_hopch");
+    k_work_init_delayable(&boot_verify_work, boot_verify_work_fn);
+    m_boot_verify_armed = false;
 #if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_QUARANTINE_PERSIST) || IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_RSSI_WEIGHT)
     persist_load();
 #endif
@@ -1573,6 +1640,7 @@ void channel_hop_ep_on_tx_fail_isr(void) {
 }
 
 void channel_hop_ep_on_tx_success_isr(void) {
+    m_boot_verify_armed = false;
 #if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_COOP_HOP)
     /* If the just-acknowledged packet was a HOP_OFFER, the dongle's
      * ACCEPT rode in the ACK payload (already consumed by the RX path
@@ -1696,6 +1764,8 @@ void channel_hop_ep_on_request(void) {}
 void channel_hop_ep_on_tx_fail_isr(void) {}
 void channel_hop_ep_on_tx_success_isr(void) {}
 uint8_t channel_hop_ep_get_committed(void) { return CHANNEL_HOP_INVALID; }
+uint8_t channel_hop_ep_get_boot_channel(void) { return CHANNEL_HOP_INVALID; }
+void channel_hop_ep_arm_boot_verify(void) {}
 uint8_t channel_hop_ep_get_quarantine_count(void) { return 0; }
 bool channel_hop_ep_is_quarantined(uint8_t channel) { ARG_UNUSED(channel); return false; }
 bool channel_hop_ep_is_active(void) { return false; }

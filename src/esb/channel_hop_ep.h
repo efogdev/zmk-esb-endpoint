@@ -35,6 +35,16 @@
 
 void channel_hop_ep_init(void);
 
+/* Last channel successfully hopped to and persisted to NVS, loaded at
+ * channel_hop_ep_init(). Returns CHANNEL_HOP_INVALID if none is stored. */
+uint8_t channel_hop_ep_get_boot_channel(void);
+
+/* Called by esb_endpoint right after retuning to a persisted boot channel.
+ * Starts the CONFIG_ZMK_ESB_ENDPOINT_BOOT_CHANNEL_VERIFY_MS watchdog that
+ * reverts to (and persists) the default channel if no TX_SUCCESS arrives
+ * in time. */
+void channel_hop_ep_arm_boot_verify(void);
+
 /* Called from esb_endpoint when pairing transitions into CONNECTED state
  * (fresh pair or successful VERIFY) and when the link drops, respectively. */
 void channel_hop_ep_on_connected(void);

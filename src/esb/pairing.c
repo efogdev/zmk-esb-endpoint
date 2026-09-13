@@ -283,3 +283,7 @@ pairing_state_t pairing_get_state(void) {
 bool pairing_is_connected(void) {
     return m_state == PAIRING_STATE_CONNECTED;
 }
+
+bool pairing_has_stored_peer(void) {
+    return m_has_stored_peer;
+}
