@@ -8,6 +8,7 @@
 #include <zephyr/arch/arm/irq.h>
 #include <zephyr/sw_isr_table.h>
 #include <hal/nrf_ppi.h>
+#include <hal/nrf_radio.h>
 #include <zephyr/drivers/clock_control.h>
 #include <zephyr/drivers/clock_control/nrf_clock_control.h>
 #include <zephyr/sys/onoff.h>
@@ -84,6 +85,23 @@ void radio_arbiter_take(void) {
     __DSB();
     irq_unlock(key);
     LOG_DBG("VTOR[RADIO] handed to ESB (0x%08x)", m_ram_vtor[16 + RADIO_IRQn]);
+}
+
+static void radio_quiesce(void) {
+    nrf_radio_int_disable(NRF_RADIO, 0xFFFFFFFFu);
+    nrf_radio_shorts_set(NRF_RADIO, 0);
+    if (nrf_radio_state_get(NRF_RADIO) != NRF_RADIO_STATE_DISABLED) {
+        nrf_radio_task_trigger(NRF_RADIO, NRF_RADIO_TASK_DISABLE);
+        for (int i = 0; i < 1000 && nrf_radio_state_get(NRF_RADIO) != NRF_RADIO_STATE_DISABLED; i++) {
+            k_busy_wait(1);
+        }
+    }
+    nrf_radio_event_clear(NRF_RADIO, NRF_RADIO_EVENT_READY);
+    nrf_radio_event_clear(NRF_RADIO, NRF_RADIO_EVENT_ADDRESS);
+    nrf_radio_event_clear(NRF_RADIO, NRF_RADIO_EVENT_PAYLOAD);
+    nrf_radio_event_clear(NRF_RADIO, NRF_RADIO_EVENT_END);
+    nrf_radio_event_clear(NRF_RADIO, NRF_RADIO_EVENT_DISABLED);
+    NVIC_ClearPendingIRQ(RADIO_IRQn);
 }
 
 static void radio_vector_restore(void) {
@@ -163,12 +181,15 @@ void radio_arbiter_prepare(void) {
     LOG_DBG("radio arbiter prepare (HFCLKSTAT=0x%08x PPI_CHEN=0x%08x)", NRF_CLOCK->HFCLKSTAT, NRF_PPI->CHEN);
     bt_ll_suspend();
     const int hfxo_err = hfxo_request();
-    if (hfxo_err) {
+    if (!hfxo_err) {
+        hfclk_held = true;
+    } else {
         LOG_DBG("radio arbiter prepare: HFXO failed (%d), radio may be unreliable", hfxo_err);
     }
 }
 
 void radio_arbiter_release(void) {
+    radio_quiesce();
     radio_vector_restore();
     bt_ll_resume();
     hfxo_release();

@@ -43,6 +43,7 @@ ZAF_CUSTOM_EVENT_DEFINE(esb_switched_to_dongle, "esb-switched");
 #endif
 
 static volatile bool esb_active;
+static uint8_t esb_locks = 0;
 
 K_THREAD_STACK_DEFINE(esb_ctrl_stack, CONFIG_ZMK_ESB_ENDPOINT_CTRL_STACK_SIZE);
 static struct k_thread esb_ctrl_thread;
@@ -50,6 +51,18 @@ K_MSGQ_DEFINE(esb_ctrl_msgq, sizeof(int), CONFIG_ZMK_ESB_ENDPOINT_CTRL_MSGQ_DEPT
 
 bool zmk_esb_endpoint_is_active(void) {
     return esb_active;
+}
+
+void zmk_esb_lock() {
+    if (esb_locks != UINT8_MAX) {
+        esb_locks++;
+    }
+}
+
+void zmk_esb_unlock() {
+    if (esb_locks != 0) {
+        esb_locks--;
+    }
 }
 
 static void configure_esb_addresses(const uint8_t channel) {
@@ -73,8 +86,7 @@ static void on_transport_evt(const esb_transport_evt_t *evt) {
     }
 }
 
-static void disconnect_conn_cb(struct bt_conn *conn, void *data)
-{
+static void disconnect_conn_cb(struct bt_conn *conn, void *data) {
     bt_conn_disconnect(conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
 }
 
@@ -95,10 +107,10 @@ int __wrap_bt_le_adv_start_legacy(struct bt_le_ext_adv *adv,
 }
 
 bool zmk_ble_radio_yielded(void) {
-    return esb_active;
+    return esb_active || zmk_ble_active_profile_index() == (ZMK_BLE_PROFILE_COUNT - 1);
 }
 
-void zmk_ble_on_ready(void) {
+bool zmk_ble_on_ready(void) {
     if (zmk_ble_active_profile_index() == (ZMK_BLE_PROFILE_COUNT - 1)) {
 #if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_HOP)
         const int cmd = ESB_CMD_ACTIVATE_BOOT;
@@ -106,7 +118,10 @@ void zmk_ble_on_ready(void) {
         const int cmd = ESB_CMD_ACTIVATE;
 #endif
         k_msgq_put(&esb_ctrl_msgq, &cmd, K_NO_WAIT);
+        return 1;
     }
+
+    return 0;
 }
 
 static void esb_ctrl_thread_fn(void *p1, void *p2, void *p3) {
@@ -115,22 +130,29 @@ static void esb_ctrl_thread_fn(void *p1, void *p2, void *p3) {
         k_msgq_get(&esb_ctrl_msgq, &cmd, K_FOREVER);
         if (cmd == ESB_CMD_ACTIVATE || cmd == ESB_CMD_ACTIVATE_BOOT) {
             LOG_DBG("ESB activate requested at %u ms", k_uptime_get_32());
+
             bt_conn_foreach(BT_CONN_TYPE_LE, disconnect_conn_cb, NULL);
-            bt_le_adv_stop();
-            k_sleep(K_MSEC(CONFIG_ZMK_ESB_ENDPOINT_BLE_QUIESCE_MS));
+            if (cmd == ESB_CMD_ACTIVATE) {
+                k_sleep(K_MSEC(CONFIG_ZMK_ESB_ENDPOINT_BLE_QUIESCE_MS));
+            }
+
             configure_esb_addresses(DT_INST_PROP(0, esb_channel));
             esb_transport_on_slot_start();
-            k_sleep(K_MSEC(1));
+
+            while (esb_locks != 0) {
+                k_sleep(K_MSEC(1));
+            }
+
             LOG_DBG("ESB addresses configured at %u ms", k_uptime_get_32());
 #if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_HOP)
-            if (cmd == ESB_CMD_ACTIVATE_BOOT && pairing_has_stored_peer()) {
+            if (pairing_has_stored_peer()) {
                 const uint8_t saved = channel_hop_ep_get_boot_channel();
                 if (saved != CHANNEL_HOP_INVALID && saved != esb_transport_get_channel()) {
                     const int err = esb_transport_set_channel(saved);
                     if (err) {
                         LOG_ERR("boot retune to saved channel %u failed: %d", saved, err);
                     } else {
-                        LOG_DBG("booted directly into ESB slot, paired; retuned to saved channel %u", saved);
+                        LOG_DBG("paired; retuned to last known-good channel %u", saved);
                         channel_hop_ep_arm_boot_verify();
                     }
                 }
@@ -152,6 +174,7 @@ static void esb_ctrl_thread_fn(void *p1, void *p2, void *p3) {
             esb_transport_on_slot_stop();
             pairing_stop();
             esb_transport_deinit();
+            k_sleep(K_MSEC(CONFIG_ZMK_ESB_ENDPOINT_BLE_QUIESCE_MS));
             zmk_ble_set_device_name((char *)CONFIG_BT_DEVICE_NAME);
         }
     }

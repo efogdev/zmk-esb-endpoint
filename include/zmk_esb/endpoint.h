@@ -8,3 +8,5 @@
 #include <stdbool.h>
 
 bool zmk_esb_endpoint_is_active(void);
+void zmk_esb_lock();
+void zmk_esb_unlock();

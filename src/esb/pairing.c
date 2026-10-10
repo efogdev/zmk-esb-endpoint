@@ -17,6 +17,7 @@
 #endif
 
 #include <zephyr/logging/log.h>
+#include "zmk_esb/endpoint.h"
 LOG_MODULE_REGISTER(zmk_esb_pairing, CONFIG_ZMK_ESB_ENDPOINT_LOG_LEVEL);
 
 #if IS_ENABLED(CONFIG_ZMK_ADAPTIVE_FEEDBACK)
@@ -84,7 +85,8 @@ static int settings_load_cb(const char *name, const size_t len, const settings_r
     return 0;
 }
 
-SETTINGS_STATIC_HANDLER_DEFINE(esb_pairing, "esb_ep", NULL, settings_load_cb, NULL, NULL);
+int settings_commit_cb() { zmk_esb_unlock(); return 0; }
+SETTINGS_STATIC_HANDLER_DEFINE(esb_pairing, "esb_ep", NULL, settings_load_cb, settings_commit_cb, NULL);
 
 static void beacon_work_fn(struct k_work *w) {
     if (m_state != PAIRING_STATE_UNPAIRED) {
@@ -105,11 +107,10 @@ static void verify_work_fn(struct k_work *w) {
 }
 
 void pairing_init(void) {
+    zmk_esb_lock();
     build_device_id();
     k_work_init_delayable(&beacon_work, beacon_work_fn);
     k_work_init_delayable(&verify_work, verify_work_fn);
-    settings_subsys_init();
-    settings_load_subtree("esb_ep");
 }
 
 void pairing_start(void) {
@@ -118,7 +119,7 @@ void pairing_start(void) {
                 m_peer_device_id[0], m_peer_device_id[1], m_peer_device_id[2],
                 m_peer_device_id[3], m_peer_device_id[4], m_peer_device_id[5]);
         m_state = PAIRING_STATE_VERIFYING;
-        k_work_reschedule(&verify_work, K_NO_WAIT);
+        verify_work_fn(NULL);
     } else {
         LOG_DBG("no dongle, advertising BEACON");
         m_state = PAIRING_STATE_UNPAIRED;

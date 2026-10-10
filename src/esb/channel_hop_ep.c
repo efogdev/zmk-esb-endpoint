@@ -12,6 +12,8 @@
 
 #include <zephyr/logging/log.h>
 
+#include "zmk_esb/endpoint.h"
+
 LOG_MODULE_REGISTER(zmk_esb_chhop_ep, CONFIG_ZMK_ESB_ENDPOINT_LOG_LEVEL);
 
 #if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_HOP)
@@ -61,7 +63,6 @@ static uint8_t m_committed_next = CHANNEL_HOP_INVALID;
 static bool m_link_up;
 
 #define BOOT_CHANNEL_SETTINGS_KEY "esb_hopch/chan"
-static uint8_t m_boot_channel = CHANNEL_HOP_INVALID;
 static uint8_t m_saved_channel = CHANNEL_HOP_INVALID;
 
 /* True iff the current m_committed_next has been acknowledged by the
@@ -505,8 +506,7 @@ static void rssi_persist_work_fn(struct k_work *w) {
 #endif /* CHANNEL_RSSI_WEIGHT */
 
 #if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_QUARANTINE_PERSIST) || IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_RSSI_WEIGHT)
-static int persist_settings_load_cb(const char *name, const size_t len,
-                                    const settings_read_cb read_cb, void *cb_arg) {
+static int persist_settings_load_cb(const char *name, const size_t len, const settings_read_cb read_cb, void *cb_arg) {
 #if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_QUARANTINE_PERSIST)
     if (settings_name_steq(name, "quar", NULL)) {
         if (len < 3 || len > PERSIST_REC_MAX) {
@@ -551,6 +551,13 @@ static int persist_settings_load_cb(const char *name, const size_t len,
                 m_hit_count++;
             }
         }
+
+        persist_rebuild_avoided();
+        memcpy(m_saved_off, m_off_buf, m_off_len);
+        m_saved_off_len = m_off_len;
+        m_saved_accum_min = m_decay_accum_min > UINT16_MAX ? UINT16_MAX : (uint16_t)m_decay_accum_min;
+        persist_decay_check();
+
         return 0;
     }
 #endif
@@ -567,20 +574,20 @@ static int persist_settings_load_cb(const char *name, const size_t len,
     return 0;
 }
 
-SETTINGS_STATIC_HANDLER_DEFINE(esb_hop, "esb_hop", NULL, persist_settings_load_cb, NULL, NULL);
+int persist_settings_commit_cb() { zmk_esb_unlock(); return 0; }
+SETTINGS_STATIC_HANDLER_DEFINE(esb_hop, "esb_hop", NULL, persist_settings_load_cb, persist_settings_commit_cb, NULL);
 
 static int boot_channel_settings_load_cb(const char *name, const size_t len, const settings_read_cb read_cb, void *cb_arg) {
     if (settings_name_steq(name, "chan", NULL) && len == sizeof(uint8_t)) {
         uint8_t ch;
         if (read_cb(cb_arg, &ch, sizeof(ch)) >= 0 && ch < CHANNEL_HOP_CHANNEL_COUNT) {
-            m_boot_channel = ch;
             m_saved_channel = ch;
         }
     }
     return 0;
 }
 
-SETTINGS_STATIC_HANDLER_DEFINE(esb_hopch, "esb_hopch", NULL, boot_channel_settings_load_cb, NULL, NULL);
+SETTINGS_STATIC_HANDLER_DEFINE(esb_hopch, "esb_hopch", NULL, boot_channel_settings_load_cb, persist_settings_commit_cb, NULL);
 
 static void persist_boot_channel(const uint8_t channel) {
     if (channel == m_saved_channel) {
@@ -591,7 +598,7 @@ static void persist_boot_channel(const uint8_t channel) {
 }
 
 uint8_t channel_hop_ep_get_boot_channel(void) {
-    return m_boot_channel;
+    return m_saved_channel;
 }
 
 static struct k_work_delayable boot_verify_work;
@@ -631,6 +638,8 @@ void channel_hop_ep_arm_boot_verify(void) {
 }
 
 static void persist_load(void) {
+    zmk_esb_lock();
+
 #if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_QUARANTINE_PERSIST)
     m_hit_count = 0;
     m_off_len = 0;
@@ -643,27 +652,16 @@ static void persist_load(void) {
     zrc_register(PERSIST_ZRC_KEY, PERSIST_N_MAX, 0, PERSIST_N_MAX);
 #endif
 #endif
-    settings_subsys_init();
-    settings_load_subtree("esb_hop");
+
 #if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_QUARANTINE_PERSIST)
-    /* Build the avoided set from whatever was seeded and snapshot the
-     * on-flash state so the first distill / flush doesn't rewrite it. */
-    persist_rebuild_avoided();
-    memcpy(m_saved_off, m_off_buf, m_off_len);
-    m_saved_off_len = m_off_len;
-    m_saved_accum_min = m_decay_accum_min > UINT16_MAX
-                      ? UINT16_MAX : (uint16_t)m_decay_accum_min;
     k_work_init_delayable(&persist_work, persist_work_fn);
-    k_work_reschedule(&persist_work,
-                      K_MSEC(CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_QUARANTINE_PERSIST_INTERVAL_MS));
-    /* Boot check: a full period may already have elapsed across prior runs. */
-    persist_decay_check();
+    k_work_reschedule(&persist_work, K_MSEC(CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_QUARANTINE_PERSIST_INTERVAL_MS));
 #endif
+
 #if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_RSSI_WEIGHT)
     memcpy(m_rssi_saved, m_channel_rssi.ewma, CHANNEL_HOP_CHANNEL_COUNT);
     k_work_init_delayable(&rssi_persist_work, rssi_persist_work_fn);
-    k_work_reschedule(&rssi_persist_work,
-                      K_MSEC(CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_RSSI_PERSIST_INTERVAL_MS));
+    k_work_reschedule(&rssi_persist_work, K_MSEC(CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_RSSI_PERSIST_INTERVAL_MS));
 #endif
 }
 #endif /* QUARANTINE_PERSIST || RSSI_WEIGHT */
@@ -723,8 +721,7 @@ static void negotiate_work_fn(struct k_work *w) {
          * INVALID for arbitrarily long stretches and the silence safety
          * net unable to hop. The cost of background ticking is one work
          * dispatch per INTERVAL_MS during long idles — negligible. */
-        k_work_reschedule(&negotiate_work,
-                          K_MSEC(CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_HOP_NEGOTIATE_INTERVAL_MS));
+        k_work_reschedule(&negotiate_work, K_MSEC(CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_HOP_NEGOTIATE_INTERVAL_MS));
         return;
     }
 
@@ -1349,10 +1346,9 @@ void channel_hop_ep_on_link_degraded_isr(void) {
 #endif /* COOP_HOP */
 
 void channel_hop_ep_init(void) {
+    zmk_esb_lock();
     quarantine_reset(&m_quarantine);
     channel_rssi_reset(&m_channel_rssi);
-    settings_subsys_init();
-    settings_load_subtree("esb_hopch");
     k_work_init_delayable(&boot_verify_work, boot_verify_work_fn);
     m_boot_verify_armed = false;
 #if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_QUARANTINE_PERSIST) || IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT_CHANNEL_RSSI_WEIGHT)

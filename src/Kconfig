@@ -364,7 +364,7 @@ config ZMK_ESB_ENDPOINT_BEACON_INITIAL_DELAY_MS
 config ZMK_ESB_ENDPOINT_VERIFY_INTERVAL_MS
     int "Identity VERIFY_REQ retransmit interval (ms)"
     default 250
-    range 50 2000
+    range 10 1000
     help
       How often the keyboard sends ESB_PKT_VERIFY_REQ while in the VERIFYING
       state (reconnect with a stored peer). A response with a matching
